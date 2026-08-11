@@ -513,7 +513,7 @@ fn build_eac3_frame_from_object(
     let mixed_presentation = pcm_frame
         .oamd_payloads
         .iter()
-        .any(|(oamd, _)| oamd.dynamic_objects > 0 && oamd.bed_or_isf_objects > 0);
+        .any(|(oamd, _)| oamd.dynamic_objects > 0 && has_fixed_bed_members(oamd));
     let (pcm, channel_labels) = build_eac3_object_output_pcm_and_labels(
         pcm_frame,
         bed_object_labels.as_deref(),
@@ -611,6 +611,16 @@ fn clear_eac3_object_metadata(sample_pos: u64, bridge: &mut AtmosBridge) -> Opti
 /// Returns `None` when the stream is not a pure bed, or when the assignment does
 /// not line up with the reconstructed channel count — the caller then keeps the
 /// regular dynamic-object path untouched.
+fn has_fixed_bed_members(oamd: &OamdPayload) -> bool {
+    oamd.isf_in_use
+        || oamd.bed_assignment.iter().flatten().any(|channel| {
+            !matches!(
+                channel,
+                BedChannel::LowFrequencyEffects | BedChannel::LowFrequencyEffects2
+            )
+        })
+}
+
 fn eac3_dynamic_mapping_valid(pcm_frame: &eac3::ObjectPcmFrame) -> bool {
     if pcm_frame.oamd_payloads.is_empty() {
         return false;
@@ -1081,6 +1091,44 @@ mod tests {
             emdf_block_count: 0,
             first_emdf_sync_offset: None,
         }
+    }
+
+    #[test]
+    fn lfe_only_bed_does_not_force_mixed_output() {
+        let oamd = OamdPayload {
+            version: 0,
+            object_count: 16,
+            alternate_object_present: false,
+            element_count: 1,
+            beds: 1,
+            bed_instances: 1,
+            bed_or_isf_objects: 1,
+            dynamic_objects: 15,
+            isf_in_use: false,
+            isf_index: None,
+            bed_assignment: vec![vec![BedChannel::LowFrequencyEffects]],
+            elements: Vec::new(),
+        };
+        assert!(!has_fixed_bed_members(&oamd));
+    }
+
+    #[test]
+    fn non_lfe_bed_forces_mixed_output() {
+        let oamd = OamdPayload {
+            version: 0,
+            object_count: 3,
+            alternate_object_present: false,
+            element_count: 1,
+            beds: 1,
+            bed_instances: 1,
+            bed_or_isf_objects: 1,
+            dynamic_objects: 2,
+            isf_in_use: false,
+            isf_index: None,
+            bed_assignment: vec![vec![BedChannel::FrontLeft]],
+            elements: Vec::new(),
+        };
+        assert!(has_fixed_bed_members(&oamd));
     }
 
     #[test]
