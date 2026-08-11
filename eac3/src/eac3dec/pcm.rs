@@ -3,9 +3,9 @@
 use super::joc::{JocObjectDecoderState, JocObjectMatrices};
 use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData};
 use super::syncframe::{
-    AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
     decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
-    inspect_legacy_ac3_access_unit,
+    inspect_legacy_ac3_access_unit, AccessUnitInfo, AuxDataDecodeState, CoreDecodeState,
+    ParseError,
 };
 use crate::BedChannel;
 
@@ -103,7 +103,10 @@ pub fn merge_core_with_dependent(
 #[derive(Debug, Clone, PartialEq)]
 /// Object-audio PCM plus the metadata that was active for the same access unit.
 ///
-/// `object_channels` only covers dynamic objects. Bed channels remain in [`CorePcmFrame`].
+/// `object_channels` contains JOC dynamic slots in stable bitstream order.
+/// For mixed OAMD presentations, bed/ISF members are the prefix of the OAMD
+/// table and slot `j` maps to OAMD object `bed_or_isf_objects + j`. Bed PCM
+/// remains in [`CorePcmFrame`].
 pub struct ObjectPcmFrame {
     pub core: CorePcmFrame,
     pub object_channels: Vec<Vec<f32>>,
@@ -118,7 +121,7 @@ impl ObjectPcmFrame {
         self.core.samples_per_channel()
     }
 
-    /// Number of dynamic object channels decoded for this frame.
+    /// Number of stable JOC output slots decoded for this frame.
     pub fn object_count(&self) -> usize {
         self.object_channels.len()
     }

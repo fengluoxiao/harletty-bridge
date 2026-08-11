@@ -38,13 +38,15 @@ pub(crate) fn build_eac3_metadata_frame(
     object_channel_count: usize,
     bridge: &mut AtmosBridge,
 ) -> RMetadataFrame {
-    let events = extract_eac3_events(oamd, evo_base, object_channel_count);
+    let dynamic_objects = eac3_dynamic_object_count(oamd, object_channel_count);
+    let events = dynamic_objects
+        .is_some()
+        .then(|| extract_eac3_events(oamd, evo_base, object_channel_count))
+        .unwrap_or_default();
 
-    let dynamic_objects = oamd
-        .object_count
-        .saturating_sub(oamd.bed_or_isf_objects)
-        .min(object_channel_count);
-    let current: RVec<bridge_api::RObjectChannel> = (0..dynamic_objects)
+    let current: RVec<bridge_api::RObjectChannel> = dynamic_objects
+        .into_iter()
+        .flat_map(|count| 0..count)
         .map(|k| bridge_api::RObjectChannel {
             id: (10 + k) as u32,
             channel: (num_bed_channels + k) as u32,
@@ -60,6 +62,12 @@ pub(crate) fn build_eac3_metadata_frame(
         sample_pos: frame_sample_pos,
         ramp_duration: 0,
     }
+}
+
+fn eac3_dynamic_object_count(oamd: &OamdPayload, object_channel_count: usize) -> Option<usize> {
+    let dynamic_objects = oamd.object_count.saturating_sub(oamd.bed_or_isf_objects);
+    (oamd.dynamic_objects == dynamic_objects && dynamic_objects == object_channel_count)
+        .then_some(dynamic_objects)
 }
 
 /// Convert an E-AC3 OAMD payload into the dynamic-object event list
@@ -204,6 +212,18 @@ mod tests {
             bed_assignment: vec![vec![eac3::BedChannel::LowFrequencyEffects]],
             elements: Vec::new(),
         }
+    }
+
+    #[test]
+    fn eac3_metadata_rejects_unproven_pcm_object_count() {
+        let mut bridge = AtmosBridge::new(false);
+        let mut payload = empty_oamd_payload();
+        payload.object_count = 3;
+        payload.dynamic_objects = 2;
+
+        let meta = build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge);
+        assert!(meta.events.is_empty());
+        assert!(meta.object_channels.is_empty());
     }
 
     #[test]
@@ -445,15 +465,14 @@ fn extract_events(
 
         let id = (i + 10 - bed_index_vec.len()) as u32;
         let render = &object_data.object_render_info;
-        let (has_pos, pos, size) =
-            match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
-                Some(raw) if raw.len() >= 3 => (true, [raw[0], raw[1], raw[2]], render.object_size),
-                Some(_) => (false, [0.0; 3], [0.0; 3]),
-                None => {
-                    missing_damf_pos += 1;
-                    (false, [0.0; 3], [0.0; 3])
-                }
-            };
+        let (has_pos, pos, size) = match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
+            Some(raw) if raw.len() >= 3 => (true, [raw[0], raw[1], raw[2]], render.object_size),
+            Some(_) => (false, [0.0; 3], [0.0; 3]),
+            None => {
+                missing_damf_pos += 1;
+                (false, [0.0; 3], [0.0; 3])
+            }
+        };
 
         objects.push((id, i));
         events.push(bridge_api::REvent {
