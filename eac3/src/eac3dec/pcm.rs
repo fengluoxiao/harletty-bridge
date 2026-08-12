@@ -3,9 +3,9 @@
 use super::joc::{JocObjectDecoderState, JocObjectMatrices};
 use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData};
 use super::syncframe::{
+    AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
     decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
-    inspect_legacy_ac3_access_unit, AccessUnitInfo, AuxDataDecodeState, CoreDecodeState,
-    ParseError,
+    inspect_legacy_ac3_access_unit,
 };
 use crate::BedChannel;
 
@@ -103,10 +103,11 @@ pub fn merge_core_with_dependent(
 #[derive(Debug, Clone, PartialEq)]
 /// Object-audio PCM plus the metadata that was active for the same access unit.
 ///
-/// `object_channels` contains JOC dynamic slots in stable bitstream order.
-/// For mixed OAMD presentations, bed/ISF members are the prefix of the OAMD
-/// table and slot `j` maps to OAMD object `bed_or_isf_objects + j`. Bed PCM
-/// remains in [`CorePcmFrame`].
+/// `object_channels` contains every decoded JOC essence slot in stable
+/// bitstream order. Except for the ordinary LFE channel carried independently
+/// by [`CorePcmFrame`], a slot may represent a non-LFE bed member, LFE2, ISF,
+/// or a dynamic object. Mapping those slots to OAMD objects is an upper-layer
+/// presentation concern.
 pub struct ObjectPcmFrame {
     pub core: CorePcmFrame,
     pub object_channels: Vec<Vec<f32>>,
@@ -418,11 +419,18 @@ impl ObjectPcmDecoder {
             _ => None,
         });
         let Some(joc) = joc else {
+            // A legal non-JOC unit is still part of the core bitstream. Decode
+            // it so IMDCT overlap/block-syntax state advances exactly as it
+            // does in PcmDecoder, then break all JOC differential/QMF history.
+            let _ = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
+            self.joc_state.reset();
+            self.frames_seen += 1;
             return Ok(None);
         };
 
-        let core = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
+        let mut core = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
         let object_channels = self.joc_state.decode_frame(&core, &joc)?;
+        self.joc_state.delay_core_frame(&mut core);
         let object_active = joc.objects.iter().map(|object| object.active).collect();
         let oamd_payloads = info
             .payloads()
@@ -493,10 +501,14 @@ impl ObjectPcmDecoder {
             _ => None,
         });
         let Some(joc) = joc else {
+            self.joc_state.reset();
+            self.frames_seen += 1;
             return Ok(None);
         };
 
+        let mut core = core;
         let object_channels = self.joc_state.decode_frame(&core, &joc)?;
+        self.joc_state.delay_core_frame(&mut core);
         let object_active = joc.objects.iter().map(|object| object.active).collect();
         let oamd_payloads = info
             .payloads()
@@ -526,6 +538,51 @@ impl ObjectPcmDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const JOC_FIXTURE: &[u8] = include_bytes!("../../tests/data/short_packet_independent_joc.bin");
+    const NO_JOC_FIXTURE: &[u8] = include_bytes!("../../tests/data/aht_independent_stereo.bin");
+
+    #[test]
+    fn object_decoder_advances_core_and_resets_joc_on_no_joc_frame() {
+        let mut decoder = ObjectPcmDecoder::default();
+        decoder
+            .push_access_unit(JOC_FIXTURE)
+            .expect("JOC fixture must decode")
+            .expect("fixture carries JOC");
+        assert!(!decoder.last_joc_matrices().is_empty());
+        assert_eq!(decoder.core_state.chinspx_snapshot().len(), 5);
+
+        let result = decoder
+            .push_access_unit(NO_JOC_FIXTURE)
+            .expect("legal non-JOC frame must decode");
+
+        assert!(result.is_none());
+        assert_eq!(decoder.frames_seen(), 2);
+        assert_eq!(
+            decoder.core_state.chinspx_snapshot().len(),
+            2,
+            "the non-JOC stereo frame must advance/reconfigure core syntax state"
+        );
+        assert!(decoder.last_joc_matrices().is_empty());
+    }
+
+    #[test]
+    fn object_decoder_with_external_core_resets_joc_on_no_joc_frame() {
+        let mut decoder = ObjectPcmDecoder::default();
+        let decoded = decoder
+            .push_access_unit(JOC_FIXTURE)
+            .expect("JOC fixture must decode")
+            .expect("fixture carries JOC");
+        assert!(!decoder.last_joc_matrices().is_empty());
+
+        let result = decoder
+            .push_access_unit_with_core(NO_JOC_FIXTURE, decoded.pcm.core)
+            .expect("legal non-JOC frame must be accepted");
+
+        assert!(result.is_none());
+        assert_eq!(decoder.frames_seen(), 2);
+        assert!(decoder.last_joc_matrices().is_empty());
+    }
 
     #[test]
     fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {

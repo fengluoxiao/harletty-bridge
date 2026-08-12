@@ -103,6 +103,8 @@ pub struct OamdObjectBlock {
     pub render_info_status: u8,
     pub render_info_blocks: Option<u8>,
     pub anchor: ObjectAnchor,
+    /// Object rendering gain in dB. Negative infinity represents silence.
+    /// `None` means the property was omitted and must retain decoder state.
     pub gain: Option<f32>,
     pub priority: Option<u8>,
     pub valid_position: bool,
@@ -214,7 +216,7 @@ struct OamdElementParseState {
 
 #[derive(Debug, Clone, Default)]
 struct OamdObjectElementParseState {
-    object_blocks: Vec<Vec<OamdObjectBlockParseState>>,
+    objects: Vec<OamdObjectBlockParseState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -235,13 +237,21 @@ impl Default for OamdObjectBlockParseState {
     fn default() -> Self {
         Self {
             anchor: ObjectAnchor::Room,
-            gain: None,
+            // ETSI TS 103 420's default ObjectBasicInfo is silent with
+            // priority zero. `None` is the public representation of the
+            // default priority, while -inf is kept explicitly so every
+            // current output adapter maps a reset/inactive object to silence.
+            gain: Some(f32::NEG_INFINITY),
             priority: None,
-            valid_position: false,
+            valid_position: true,
             differential_position: false,
-            position: None,
+            position: Some(Vec3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            }),
             distance: None,
-            size: None,
+            size: Some([0.0; 3]),
             screen_factor: None,
             depth_factor: None,
         }
@@ -293,17 +303,13 @@ impl OamdElementParseState {
             return;
         };
 
-        let block_count = object_element.block_updates.len();
-        let needs_reset = self.object.as_ref().is_none_or(|state| {
-            state.object_blocks.len() != object_count
-                || state.object_blocks.first().map(Vec::len).unwrap_or(0) != block_count
-        });
+        let needs_reset = self
+            .object
+            .as_ref()
+            .is_none_or(|state| state.objects.len() != object_count);
         if needs_reset {
             self.object = Some(OamdObjectElementParseState {
-                object_blocks: vec![
-                    vec![OamdObjectBlockParseState::default(); block_count];
-                    object_count
-                ],
+                objects: vec![OamdObjectBlockParseState::default(); object_count],
             });
         }
 
@@ -319,75 +325,150 @@ impl OamdObjectElementParseState {
         element: &mut OamdObjectElement,
         bed_or_isf_objects: usize,
     ) {
+        let mut previous_object_gain = vec![0.0; element.block_updates.len()];
         for (object_index, blocks) in element.object_blocks.iter_mut().enumerate() {
             for (block_index, block) in blocks.iter_mut().enumerate() {
-                self.object_blocks[object_index][block_index]
-                    .resolve_block(block, object_index < bed_or_isf_objects);
+                let gain_selected = !block.inactive
+                    && match block.basic_info_status {
+                        1 => true,
+                        3 => block.basic_info_blocks.is_some_and(|mask| (mask & 1) != 0),
+                        _ => false,
+                    };
+                if gain_selected && block.gain.is_some_and(f32::is_nan) {
+                    block.gain = Some(previous_object_gain[block_index]);
+                }
+                self.objects[object_index].resolve_block(block, object_index < bed_or_isf_objects);
+                if gain_selected {
+                    previous_object_gain[block_index] = block.gain.unwrap_or(0.0);
+                }
             }
         }
     }
 }
 
 impl OamdObjectBlockParseState {
+    fn reset_basic(&mut self) {
+        self.gain = Some(f32::NEG_INFINITY);
+        self.priority = None;
+    }
+
+    fn reset_render(&mut self) {
+        self.anchor = ObjectAnchor::Room;
+        self.valid_position = true;
+        self.differential_position = false;
+        self.position = Some(Vec3 {
+            x: 0.5,
+            y: 0.5,
+            z: 0.0,
+        });
+        self.distance = None;
+        self.size = Some([0.0; 3]);
+        self.screen_factor = None;
+        self.depth_factor = None;
+    }
+
+    fn clear_inactive_render(&mut self) {
+        self.anchor = ObjectAnchor::Room;
+        self.valid_position = false;
+        self.differential_position = false;
+        self.position = None;
+        self.distance = None;
+        self.size = None;
+        self.screen_factor = None;
+        self.depth_factor = None;
+    }
+
     fn resolve_block(&mut self, parsed: &mut OamdObjectBlock, bed_or_isf_object: bool) {
-        let inactive = parsed.inactive;
-        let basic_info_status = if inactive {
-            0
-        } else {
-            parsed.basic_info_status
-        };
-        if (basic_info_status & 1) != 0 {
-            let blocks = parsed
-                .basic_info_blocks
-                .unwrap_or(if basic_info_status == 1 { 3 } else { 0 });
-
-            if (blocks & 2) != 0
-                && let Some(gain) = parsed.gain
-            {
-                self.gain = Some(gain);
-            }
-
-            if (blocks & 1) != 0 && parsed.priority.is_some() {
-                self.priority = parsed.priority;
-            }
+        if parsed.inactive {
+            self.reset_basic();
+            self.clear_inactive_render();
+            self.write_to(parsed);
+            return;
         }
 
-        let render_info_status = if inactive || bed_or_isf_object {
-            0
-        } else {
-            parsed.render_info_status
-        };
-        if (render_info_status & 1) != 0 {
-            let blocks = parsed
-                .render_info_blocks
-                .unwrap_or(if render_info_status == 1 { 15 } else { 0 });
-
-            self.valid_position = (blocks & 1) != 0;
-            if self.valid_position {
-                self.differential_position = parsed.differential_position;
-                if let Some(position) = parsed.position {
-                    self.position = Some(position);
+        match parsed.basic_info_status {
+            0 => self.reset_basic(),
+            1 => {
+                self.gain = parsed.gain.or(Some(f32::NEG_INFINITY));
+                self.priority = parsed.priority;
+            }
+            2 => {}
+            3 => {
+                let mask = parsed.basic_info_blocks.unwrap_or(0);
+                if (mask & 1) != 0 {
+                    self.gain = parsed.gain.or(Some(f32::NEG_INFINITY));
                 }
-                self.distance = parsed.distance;
+                if (mask & 2) != 0 {
+                    self.priority = parsed.priority;
+                }
             }
-
-            if (blocks & 4) != 0
-                && let Some(size) = parsed.size
-            {
-                self.size = Some(size);
-            }
-
-            if (blocks & 8) != 0 && parsed.anchor == ObjectAnchor::Screen {
-                self.anchor = ObjectAnchor::Screen;
-                self.screen_factor = parsed.screen_factor;
-                self.depth_factor = parsed.depth_factor;
-            }
+            _ => unreachable!("basic-info status is two bits"),
         }
 
         if bed_or_isf_object {
+            self.reset_render();
             self.anchor = ObjectAnchor::Speaker;
+        } else {
+            match parsed.render_info_status {
+                0 => self.reset_render(),
+                1 => {
+                    self.reset_render();
+                    self.update_render(parsed, 15);
+                }
+                2 => {}
+                3 => self.update_render(parsed, parsed.render_info_blocks.unwrap_or(0)),
+                _ => unreachable!("render-info status is two bits"),
+            }
         }
 
+        self.write_to(parsed);
+    }
+
+    fn update_render(&mut self, parsed: &OamdObjectBlock, mask: u8) {
+        if (mask & 1) != 0 {
+            self.valid_position = true;
+            if let Some(position) = parsed.position {
+                self.position = Some(if parsed.differential_position {
+                    let previous = self.position.unwrap_or(Vec3 {
+                        x: 0.5,
+                        y: 0.5,
+                        z: 0.0,
+                    });
+                    Vec3 {
+                        x: (previous.x + position.x).clamp(0.0, 1.0),
+                        y: (previous.y + position.y).clamp(0.0, 1.0),
+                        z: (previous.z + position.z).clamp(-1.0, 1.0),
+                    }
+                } else {
+                    position
+                });
+            }
+            // The public object interface exposes the resolved absolute
+            // position; differential coding is only a bitstream detail.
+            self.differential_position = false;
+            self.distance = parsed.distance;
+        }
+
+        if (mask & 4) != 0 {
+            self.size = parsed.size.or(Some([0.0; 3]));
+        }
+
+        if (mask & 8) != 0 {
+            self.anchor = parsed.anchor;
+            if parsed.anchor == ObjectAnchor::Screen {
+                self.screen_factor = parsed.screen_factor;
+                self.depth_factor = parsed.depth_factor;
+            } else {
+                // A transmitted non-screen anchor explicitly leaves screen
+                // space, rather than retaining stale screen/depth attributes.
+                self.anchor = ObjectAnchor::Room;
+                self.screen_factor = None;
+                self.depth_factor = None;
+            }
+        }
+    }
+
+    fn write_to(&self, parsed: &mut OamdObjectBlock) {
         parsed.anchor = self.anchor;
         parsed.gain = self.gain;
         parsed.priority = self.priority;
@@ -736,26 +817,32 @@ fn parse_oamd_object_block(
         };
         basic_info_blocks = Some(blocks);
 
-        if (blocks & 2) != 0 {
+        if (blocks & 1) != 0 {
             let gain_code = read_bits(reader, 2, "oa_gain_helper")?;
             gain = match gain_code {
-                0 => Some(0.707),
-                1 => Some(0.0),
+                0 => Some(0.0),
+                1 => Some(f32::NEG_INFINITY),
                 2 => {
-                    let gain_step = read_bits(reader, 6, "oa_gain_step")? as i32;
-                    let gain_db = if gain_step < 15 {
-                        15 - gain_step
+                    let gain_bits = read_bits(reader, 6, "oa_gain_step")? as i32;
+                    let gain_db = if gain_bits < 15 {
+                        15 - gain_bits
                     } else {
-                        14 - gain_step
+                        14 - gain_bits
                     };
-                    Some(db_to_gain(gain_db as f32) * 0.707)
+                    Some(gain_db as f32)
                 }
-                _ => None,
+                // Resolved against the preceding object at the same metadata
+                // update point after per-object cross-frame state is applied.
+                _ => Some(f32::NAN),
             };
         }
 
-        if (blocks & 1) != 0 && !read_bit(reader, "oa_default_priority")? {
-            priority = Some(read_bits(reader, 5, "oa_priority")? as u8);
+        if (blocks & 2) != 0 {
+            priority = Some(if read_bit(reader, "oa_default_priority")? {
+                31
+            } else {
+                read_bits(reader, 5, "oa_priority")? as u8
+            });
         }
     }
 
@@ -1236,10 +1323,6 @@ fn read_bit_vec(reader: &mut BitReader<'_>, bits: usize) -> Result<Vec<bool>, Pa
         result[index] = read_bit(reader, "bit-array")?;
     }
     Ok(result)
-}
-
-fn db_to_gain(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
 }
 
 const BED_CHANNELS: [BedChannel; 17] = [
@@ -1932,25 +2015,104 @@ mod tests {
         &object.object_blocks[0][1]
     }
 
+    fn push_bits(bits: &mut Vec<bool>, value: u32, width: usize) {
+        for shift in (0..width).rev() {
+            bits.push(((value >> shift) & 1) != 0);
+        }
+    }
+
+    fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (index, bit) in bits.iter().enumerate() {
+            if *bit {
+                bytes[index / 8] |= 1 << (7 - index % 8);
+            }
+        }
+        bytes
+    }
+
     #[test]
-    fn oamd_state_reuses_omitted_fields_across_frames() {
+    fn oamd_full_block_parser_populates_normative_default_fields() {
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 0, 1); // active; block zero implies both status values are 1
+        push_bits(&mut bits, 1, 2); // -inf gain
+        push_bits(&mut bits, 1, 1); // default priority
+        push_bits(&mut bits, 31, 6); // centered x
+        push_bits(&mut bits, 31, 6); // centered y
+        push_bits(&mut bits, 1, 1); // positive z sign
+        push_bits(&mut bits, 0, 4); // zero z magnitude
+        push_bits(&mut bits, 0, 1); // no distance
+        push_bits(&mut bits, 0, 4); // default zone/elevation fields
+        push_bits(&mut bits, 0, 2); // point-source size
+        push_bits(&mut bits, 0, 1); // room, not screen, anchor
+        push_bits(&mut bits, 0, 1); // no snap-to-channel
+        push_bits(&mut bits, 0, 1); // no additional table data
+
+        let bytes = bits_to_bytes(&bits);
+        let mut reader = BitReader::new(&bytes);
+        reader.set_limit_bits(bits.len());
+        let parsed = parse_oamd_object_block(&mut reader, 0, 0, false).expect("object block");
+
+        assert_eq!(parsed.basic_info_status, 1);
+        assert_eq!(parsed.basic_info_blocks, Some(3));
+        assert!(parsed.gain.is_some_and(|gain| gain == f32::NEG_INFINITY));
+        assert_eq!(parsed.priority, Some(31));
+        assert_eq!(parsed.render_info_status, 1);
+        assert_eq!(parsed.render_info_blocks, Some(15));
+        assert_eq!(parsed.anchor, ObjectAnchor::Room);
+        assert!(parsed.valid_position);
+        assert_eq!(
+            parsed.position,
+            Some(Vec3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            })
+        );
+        assert_eq!(parsed.distance, None);
+        assert_eq!(parsed.size, Some([0.0; 3]));
+        assert_eq!(parsed.screen_factor, None);
+        assert_eq!(parsed.depth_factor, None);
+    }
+
+    #[test]
+    fn oamd_parse_state_uses_normative_group_defaults() {
+        let state = OamdObjectBlockParseState::default();
+        assert!(state.gain.is_some_and(|gain| gain == f32::NEG_INFINITY));
+        assert_eq!(state.priority, None);
+        assert_eq!(state.anchor, ObjectAnchor::Room);
+        assert!(state.valid_position);
+        assert_eq!(
+            state.position,
+            Some(Vec3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            })
+        );
+        assert_eq!(state.distance, None);
+        assert_eq!(state.size, Some([0.0; 3]));
+        assert_eq!(state.screen_factor, None);
+        assert_eq!(state.depth_factor, None);
+    }
+
+    #[test]
+    fn oamd_statuses_reset_replace_retain_and_mask_groups() {
         let position = Vec3 {
             x: 0.25,
             y: 0.5,
             z: -0.25,
         };
-        let mut initial = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
+        let mut payload = payload_with_object_blocks(vec![vec![
             OamdObjectBlock {
-                basic_info_status: 3,
+                basic_info_status: 1,
                 basic_info_blocks: Some(3),
-                render_info_status: 3,
-                render_info_blocks: Some(13),
+                render_info_status: 1,
+                render_info_blocks: Some(15),
                 anchor: ObjectAnchor::Screen,
-                gain: Some(0.5),
+                gain: Some(-6.0),
                 priority: Some(7),
                 valid_position: true,
-                differential_position: false,
                 position: Some(position),
                 distance: Some(4.0),
                 size: Some([0.25, 0.25, 0.25]),
@@ -1958,9 +2120,20 @@ mod tests {
                 depth_factor: Some(2.0),
                 ..OamdObjectBlock::default()
             },
-        ]]);
-        let mut omitted = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
+            OamdObjectBlock {
+                basic_info_status: 2,
+                render_info_status: 2,
+                ..OamdObjectBlock::default()
+            },
+            OamdObjectBlock {
+                basic_info_status: 3,
+                basic_info_blocks: Some(1),
+                render_info_status: 3,
+                render_info_blocks: Some(4),
+                gain: Some(-3.0),
+                size: Some([0.75, 0.75, 0.75]),
+                ..OamdObjectBlock::default()
+            },
             OamdObjectBlock {
                 basic_info_status: 0,
                 render_info_status: 0,
@@ -1969,74 +2142,196 @@ mod tests {
         ]]);
 
         let mut state = MetadataParseState::default();
-        state.oamd.resolve_payload(&mut initial);
-        state.oamd.resolve_payload(&mut omitted);
+        state.oamd.resolve_payload(&mut payload);
+        let OamdElementKind::Object(object) = &payload.elements[0].kind else {
+            panic!("expected object element");
+        };
 
-        let resolved = second_block(&omitted);
-        assert_eq!(resolved.anchor, ObjectAnchor::Screen);
-        assert_eq!(resolved.gain, Some(0.5));
-        assert_eq!(resolved.priority, Some(7));
-        assert!(resolved.valid_position);
-        assert!(!resolved.differential_position);
-        assert_eq!(resolved.position, Some(position));
-        assert_eq!(resolved.distance, Some(4.0));
-        assert_eq!(resolved.size, Some([0.25, 0.25, 0.25]));
-        assert_eq!(resolved.screen_factor, Some(0.5));
-        assert_eq!(resolved.depth_factor, Some(2.0));
+        let retained = &object.object_blocks[0][1];
+        assert_eq!(retained.gain, Some(-6.0));
+        assert_eq!(retained.priority, Some(7));
+        assert_eq!(retained.anchor, ObjectAnchor::Screen);
+        assert_eq!(retained.position, Some(position));
+        assert_eq!(retained.size, Some([0.25; 3]));
+        assert_eq!(retained.screen_factor, Some(0.5));
+        assert_eq!(retained.depth_factor, Some(2.0));
+
+        let selective = &object.object_blocks[0][2];
+        assert_eq!(selective.gain, Some(-3.0));
+        assert_eq!(selective.priority, Some(7));
+        assert!(selective.valid_position);
+        assert_eq!(selective.position, Some(position));
+        assert_eq!(selective.distance, Some(4.0));
+        assert_eq!(selective.size, Some([0.75; 3]));
+        assert_eq!(selective.anchor, ObjectAnchor::Screen);
+        assert_eq!(selective.screen_factor, Some(0.5));
+        assert_eq!(selective.depth_factor, Some(2.0));
+
+        let reset = &object.object_blocks[0][3];
+        assert!(reset.gain.is_some_and(|gain| gain == f32::NEG_INFINITY));
+        assert_eq!(reset.priority, None);
+        assert_eq!(reset.anchor, ObjectAnchor::Room);
+        assert!(reset.valid_position);
+        assert_eq!(
+            reset.position,
+            Some(Vec3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            })
+        );
+        assert_eq!(reset.distance, None);
+        assert_eq!(reset.size, Some([0.0; 3]));
+        assert_eq!(reset.screen_factor, None);
+        assert_eq!(reset.depth_factor, None);
     }
 
     #[test]
-    fn oamd_state_clears_valid_position_when_render_info_excludes_position() {
-        let position = Vec3 {
-            x: 0.75,
-            y: 0.125,
-            z: 0.5,
+    fn oamd_gain_reuse_follows_previous_object_in_same_update() {
+        let gain_block = |gain| OamdObjectBlock {
+            basic_info_status: 3,
+            basic_info_blocks: Some(1),
+            gain: Some(gain),
+            ..OamdObjectBlock::default()
         };
-        let mut first = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
+        let mut payload = payload_with_object_blocks(vec![
+            vec![gain_block(f32::NAN)],
+            vec![gain_block(-4.0)],
+            vec![gain_block(f32::NAN)],
+        ]);
+
+        let mut state = MetadataParseState::default();
+        state.oamd.resolve_payload(&mut payload);
+
+        let OamdElementKind::Object(object) = &payload.elements[0].kind else {
+            panic!("expected object element");
+        };
+        assert_eq!(object.object_blocks[0][0].gain, Some(0.0));
+        assert_eq!(object.object_blocks[1][0].gain, Some(-4.0));
+        assert_eq!(object.object_blocks[2][0].gain, Some(-4.0));
+    }
+
+    #[test]
+    fn oamd_differential_position_advances_object_history() {
+        let mut payload = payload_with_object_blocks(vec![vec![
             OamdObjectBlock {
-                basic_info_status: 3,
-                basic_info_blocks: Some(3),
-                render_info_status: 3,
-                render_info_blocks: Some(13),
-                anchor: ObjectAnchor::Screen,
-                gain: Some(0.8),
-                priority: Some(3),
+                render_info_status: 1,
+                render_info_blocks: Some(15),
                 valid_position: true,
-                differential_position: true,
-                position: Some(position),
-                distance: Some(3.2),
-                size: Some([0.4, 0.4, 0.4]),
-                screen_factor: Some(0.625),
-                depth_factor: Some(0.5),
+                position: Some(Vec3 {
+                    x: 0.5,
+                    y: 0.5,
+                    z: 0.0,
+                }),
                 ..OamdObjectBlock::default()
             },
-        ]]);
-        let mut second = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
             OamdObjectBlock {
-                basic_info_status: 0,
                 render_info_status: 3,
-                render_info_blocks: Some(4),
-                size: Some([0.75, 0.75, 0.75]),
+                render_info_blocks: Some(1),
+                valid_position: true,
+                differential_position: true,
+                position: Some(Vec3 {
+                    x: 0.1,
+                    y: -0.2,
+                    z: 0.3,
+                }),
                 ..OamdObjectBlock::default()
             },
         ]]);
 
         let mut state = MetadataParseState::default();
-        state.oamd.resolve_payload(&mut first);
-        state.oamd.resolve_payload(&mut second);
+        state.oamd.resolve_payload(&mut payload);
 
-        let resolved = second_block(&second);
-        assert_eq!(resolved.anchor, ObjectAnchor::Screen);
-        assert_eq!(resolved.gain, Some(0.8));
-        assert_eq!(resolved.priority, Some(3));
-        assert!(!resolved.valid_position);
-        assert!(resolved.differential_position);
+        let resolved = second_block(&payload);
+        assert!(!resolved.differential_position);
+        assert_eq!(
+            resolved.position,
+            Some(Vec3 {
+                x: 0.6,
+                y: 0.3,
+                z: 0.3,
+            })
+        );
+    }
+
+    #[test]
+    fn oamd_non_screen_anchor_clears_screen_state_but_keeps_position() {
+        let position = Vec3 {
+            x: 0.75,
+            y: 0.125,
+            z: 0.5,
+        };
+        let mut payload = payload_with_object_blocks(vec![vec![
+            OamdObjectBlock {
+                render_info_status: 1,
+                render_info_blocks: Some(15),
+                anchor: ObjectAnchor::Screen,
+                valid_position: true,
+                position: Some(position),
+                size: Some([0.4; 3]),
+                screen_factor: Some(0.625),
+                depth_factor: Some(0.5),
+                ..OamdObjectBlock::default()
+            },
+            OamdObjectBlock {
+                basic_info_status: 2,
+                render_info_status: 3,
+                render_info_blocks: Some(8),
+                anchor: ObjectAnchor::Room,
+                ..OamdObjectBlock::default()
+            },
+        ]]);
+
+        let mut state = MetadataParseState::default();
+        state.oamd.resolve_payload(&mut payload);
+
+        let resolved = second_block(&payload);
+        assert_eq!(resolved.anchor, ObjectAnchor::Room);
+        assert!(resolved.valid_position);
         assert_eq!(resolved.position, Some(position));
-        assert_eq!(resolved.distance, Some(3.2));
-        assert_eq!(resolved.size, Some([0.75, 0.75, 0.75]));
-        assert_eq!(resolved.screen_factor, Some(0.625));
-        assert_eq!(resolved.depth_factor, Some(0.5));
+        assert_eq!(resolved.size, Some([0.4; 3]));
+        assert_eq!(resolved.screen_factor, None);
+        assert_eq!(resolved.depth_factor, None);
+    }
+
+    #[test]
+    fn oamd_inactive_is_silent_and_clears_render_history() {
+        let mut payload = payload_with_object_blocks(vec![vec![
+            OamdObjectBlock {
+                basic_info_status: 1,
+                gain: Some(-3.0),
+                priority: Some(12),
+                render_info_status: 1,
+                anchor: ObjectAnchor::Screen,
+                valid_position: true,
+                position: Some(Vec3 {
+                    x: 0.25,
+                    y: 0.75,
+                    z: 0.5,
+                }),
+                size: Some([0.5; 3]),
+                screen_factor: Some(0.75),
+                depth_factor: Some(1.0),
+                ..OamdObjectBlock::default()
+            },
+            OamdObjectBlock {
+                inactive: true,
+                ..OamdObjectBlock::default()
+            },
+        ]]);
+
+        let mut state = MetadataParseState::default();
+        state.oamd.resolve_payload(&mut payload);
+
+        let inactive = second_block(&payload);
+        assert!(inactive.gain.is_some_and(|gain| gain == f32::NEG_INFINITY));
+        assert_eq!(inactive.priority, None);
+        assert_eq!(inactive.anchor, ObjectAnchor::Room);
+        assert!(!inactive.valid_position);
+        assert_eq!(inactive.position, None);
+        assert_eq!(inactive.distance, None);
+        assert_eq!(inactive.size, None);
+        assert_eq!(inactive.screen_factor, None);
+        assert_eq!(inactive.depth_factor, None);
     }
 }

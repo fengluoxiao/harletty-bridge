@@ -72,6 +72,17 @@ fn eac3_dynamic_object_count(oamd: &OamdPayload, object_channel_count: usize) ->
 
 /// Convert an E-AC3 OAMD payload into the dynamic-object event list
 /// (`id = 10 + dynamic_idx`, matching the object↔channel declaration).
+fn object_gain_db(gain: Option<f32>, inactive: bool) -> i8 {
+    if inactive {
+        return i8::MIN;
+    }
+    match gain {
+        Some(value) if value.is_finite() => value.round().clamp(-127.0, 127.0) as i8,
+        Some(_) => i8::MIN,
+        None => 0,
+    }
+}
+
 fn extract_eac3_events(
     oamd: &OamdPayload,
     base_sample_pos: u64,
@@ -88,14 +99,7 @@ fn extract_eac3_events(
             continue;
         };
 
-        for obj_idx in 0..obj_element.object_blocks.len() {
-            let Some(blocks) = obj_element.object_blocks.get(obj_idx) else {
-                continue;
-            };
-            let Some(block) = blocks.first() else {
-                continue;
-            };
-
+        for (obj_idx, blocks) in obj_element.object_blocks.iter().enumerate() {
             if obj_idx < oamd.bed_or_isf_objects {
                 continue;
             }
@@ -104,91 +108,87 @@ fn extract_eac3_events(
                 continue;
             }
             let id = (10 + dynamic_idx) as u32;
-            let has_pos = block.valid_position;
-            let pos: [f64; 3] = if has_pos {
-                match block.position.as_ref() {
-                    Some(p) if !block.differential_position => [
-                        ((p.x as f64).clamp(0.0, 1.0) - 0.5) * 2.0,
-                        (0.5 - (p.y as f64).clamp(0.0, 1.0)) * 2.0,
-                        (p.z as f64).clamp(-1.0, 1.0),
-                    ],
-                    Some(p) => [
-                        (p.x as f64).clamp(-1.0, 1.0),
-                        (-(p.y as f64)).clamp(-1.0, 1.0),
-                        (p.z as f64).clamp(-1.0, 1.0),
-                    ],
-                    None => [0.0; 3],
+
+            for (block_index, block) in blocks.iter().enumerate() {
+                let update = obj_element.block_updates.get(block_index);
+                let sample_offset = update.map_or(0, |value| value.offset as u64);
+                let ramp_duration = update.map_or(0, |value| value.ramp_duration as u32);
+                let has_pos = block.valid_position;
+                let pos: [f64; 3] = if has_pos {
+                    match block.position.as_ref() {
+                        Some(p) if !block.differential_position => [
+                            ((p.x as f64).clamp(0.0, 1.0) - 0.5) * 2.0,
+                            (0.5 - (p.y as f64).clamp(0.0, 1.0)) * 2.0,
+                            (p.z as f64).clamp(-1.0, 1.0),
+                        ],
+                        Some(p) => [
+                            (p.x as f64).clamp(-1.0, 1.0),
+                            (-(p.y as f64)).clamp(-1.0, 1.0),
+                            (p.z as f64).clamp(-1.0, 1.0),
+                        ],
+                        None => [0.0; 3],
+                    }
+                } else {
+                    [0.0; 3]
+                };
+                let size = block
+                    .size
+                    .map(|value| [value[0] as f64, value[1] as f64, value[2] as f64])
+                    .unwrap_or([0.0; 3]);
+
+                if size != [0.0; 3] {
+                    bridge_diag_log(
+                        log::Level::Info,
+                        &format!(
+                            "[harletty][object-size] non-zero detected obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} size={:?} ramp={}",
+                            obj_idx,
+                            dynamic_idx,
+                            id,
+                            base_sample_pos + sample_offset,
+                            sample_offset,
+                            has_pos,
+                            size,
+                            ramp_duration
+                        ),
+                    );
                 }
-            } else {
-                [0.0; 3]
-            };
-            let size: [f64; 3] = block
-                .size
-                .map(|s| [s[0] as f64, s[1] as f64, s[2] as f64])
-                .unwrap_or([0.0, 0.0, 0.0]);
+                if block.distance.is_some()
+                    || block.screen_factor.is_some()
+                    || block.depth_factor.is_some()
+                    || block.anchor != eac3::ObjectAnchor::Room
+                {
+                    bridge_diag_log(
+                        log::Level::Info,
+                        &format!(
+                            "[harletty][oamd] visual attrs obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} anchor={:?} distance={:?} screen_factor={:?} depth_factor={:?} size={:?}",
+                            obj_idx,
+                            dynamic_idx,
+                            id,
+                            base_sample_pos + sample_offset,
+                            sample_offset,
+                            block.anchor,
+                            block.distance,
+                            block.screen_factor,
+                            block.depth_factor,
+                            size
+                        ),
+                    );
+                }
 
-            let sample_offset = obj_element
-                .block_updates
-                .first()
-                .map(|u| u.offset as u64)
-                .unwrap_or(0);
-            let ramp_duration = obj_element
-                .block_updates
-                .first()
-                .map(|u| u.ramp_duration as u32)
-                .unwrap_or(0);
-
-            if size != [0.0, 0.0, 0.0] {
-                bridge_diag_log(
-                    log::Level::Info,
-                    &format!(
-                        "[harletty][object-size] non-zero detected obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} size={:?} ramp={}",
-                        obj_idx,
-                        dynamic_idx,
-                        id,
-                        base_sample_pos + sample_offset,
-                        sample_offset,
-                        has_pos,
-                        size,
-                        ramp_duration
-                    ),
-                );
+                events.push(bridge_api::REvent {
+                    id,
+                    sample_pos: base_sample_pos + sample_offset,
+                    has_pos,
+                    pos,
+                    gain_db: object_gain_db(block.gain, block.inactive),
+                    size,
+                    ramp_duration,
+                });
             }
-            if block.distance.is_some()
-                || block.screen_factor.is_some()
-                || block.depth_factor.is_some()
-                || block.anchor != eac3::ObjectAnchor::Room
-            {
-                bridge_diag_log(
-                    log::Level::Info,
-                    &format!(
-                        "[harletty][oamd] visual attrs obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} anchor={:?} distance={:?} screen_factor={:?} depth_factor={:?} size={:?}",
-                        obj_idx,
-                        dynamic_idx,
-                        id,
-                        base_sample_pos + sample_offset,
-                        sample_offset,
-                        block.anchor,
-                        block.distance,
-                        block.screen_factor,
-                        block.depth_factor,
-                        size
-                    ),
-                );
-            }
-
-            events.push(bridge_api::REvent {
-                id,
-                sample_pos: base_sample_pos + sample_offset,
-                has_pos,
-                pos,
-                gain_db: block.gain.unwrap_or(0.0) as i8,
-                size,
-                ramp_duration,
-            });
         }
     }
 
+    events.sort_by_key(|event| event.sample_pos);
     events
 }
 
@@ -196,6 +196,14 @@ fn extract_eac3_events(
 mod tests {
     use super::*;
     use crate::bridge::AtmosBridge;
+
+    #[test]
+    fn object_gain_preserves_db_and_silence() {
+        assert_eq!(object_gain_db(Some(-3.0), false), -3);
+        assert_eq!(object_gain_db(Some(f32::NEG_INFINITY), false), i8::MIN);
+        assert_eq!(object_gain_db(None, false), 0);
+        assert_eq!(object_gain_db(Some(0.0), true), i8::MIN);
+    }
 
     fn empty_oamd_payload() -> OamdPayload {
         OamdPayload {
@@ -298,16 +306,27 @@ mod tests {
                 byte_length: 0,
                 kind: OamdElementKind::Object(OamdObjectElement {
                     sample_offset: 0,
-                    block_updates: vec![OamdBlockUpdate {
-                        offset: 0,
-                        ramp_duration: 0,
-                    }],
-                    object_blocks: vec![vec![block]],
+                    block_updates: vec![
+                        OamdBlockUpdate {
+                            offset: 0,
+                            ramp_duration: 0,
+                        },
+                        OamdBlockUpdate {
+                            offset: 64,
+                            ramp_duration: 32,
+                        },
+                    ],
+                    object_blocks: vec![vec![block.clone(), block]],
                 }),
             }],
         };
 
-        let events = extract_eac3_events(&payload, 0, 1);
+        let events = extract_eac3_events(&payload, 100, 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sample_pos, 100);
+        assert_eq!(events[0].ramp_duration, 0);
+        assert_eq!(events[1].sample_pos, 164);
+        assert_eq!(events[1].ramp_duration, 32);
         let dynamic = events.iter().find(|e| e.has_pos).expect("dynamic event");
         let expected: [f64; 3] = [0.2_f32 as f64, 0.5_f32 as f64, 0.9_f32 as f64];
         for axis in 0..3 {

@@ -12,6 +12,7 @@ mod qmf;
 mod syncframe;
 
 pub use decoder::{Decoder, PushResult};
+pub use joc::JOC_QMF_LATENCY_SAMPLES;
 pub use metadata::{
     JocObject, JocObjectData, JocPayload, OamdBlockUpdate, OamdElement, OamdElementKind,
     OamdObjectBlock, OamdObjectElement, OamdPayload, ParsedEmdfPayloadData, ParsedEmdfPayloadKind,
