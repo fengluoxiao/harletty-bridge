@@ -116,11 +116,11 @@ impl ImdctState {
     fn prepare_256_intermediates(&mut self, coeffs: &[f32; 256]) {
         let x = x256();
         for (index, slot) in self.intermediate_256_a.iter_mut().enumerate() {
-            *slot = Complex32::new(coeffs[254 - 4 * index], coeffs[2 * index]) * x[index];
+            *slot = Complex32::new(coeffs[254 - 4 * index], coeffs[4 * index]) * x[index];
         }
         // https://github.com/FFmpeg/FFmpeg/blob/415b466d41ac81856abc76d7a9341132b0f668b0/libavcodec/ac3dec.c#L587
         for (index, slot) in self.intermediate_256_b.iter_mut().enumerate() {
-            *slot = Complex32::new(coeffs[255 - 4 * index], coeffs[2 * index + 1]) * x[index];
+            *slot = Complex32::new(coeffs[255 - 4 * index], coeffs[4 * index + 1]) * x[index];
         }
     }
 }
@@ -215,6 +215,10 @@ mod tests {
         let mut coeffs = [0.0f32; 256];
         coeffs[0] = 2.0;
         coeffs[1] = 3.0;
+        coeffs[4] = 7.0;
+        coeffs[5] = 11.0;
+        coeffs[250] = 13.0;
+        coeffs[251] = 17.0;
         coeffs[255] = 5.0;
 
         state.prepare_256_intermediates(&coeffs);
@@ -223,5 +227,15 @@ mod tests {
         let expected = Complex32::new(5.0, 3.0) * x256()[0];
         assert!((sample.re - expected.re).abs() < 1e-6);
         assert!((sample.im - expected.im).abs() < 1e-6);
+
+        let even = state.intermediate_256_a[1];
+        let expected_even = Complex32::new(13.0, 7.0) * x256()[1];
+        assert!((even.re - expected_even.re).abs() < 1e-6);
+        assert!((even.im - expected_even.im).abs() < 1e-6);
+
+        let odd = state.intermediate_256_b[1];
+        let expected_odd = Complex32::new(17.0, 11.0) * x256()[1];
+        assert!((odd.re - expected_odd.re).abs() < 1e-6);
+        assert!((odd.im - expected_odd.im).abs() < 1e-6);
     }
 }
