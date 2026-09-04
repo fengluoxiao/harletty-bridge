@@ -560,13 +560,42 @@ fn decode_parameter_points(
                 }
             }
         }
-        JocObjectData::Sparse { .. } => {
-            // The available ETSI commentary identifies the differential
-            // domains but does not unambiguously specify the reconstruction
-            // order. Returning success with an all-zero matrix silently drops
-            // active objects, so reject sparse payloads until the algorithm can
-            // be verified against a normative/known vector.
-            return Err(ParseError::UnsupportedFeature("joc-sparse"));
+        JocObjectData::Sparse {
+            channel_indices,
+            vectors,
+        } => {
+            if channel_indices.len() != data_points || vectors.len() != data_points {
+                return Err(ParseError::InvalidHeader("joc_sparse_points"));
+            }
+            let nquant = if quantization_table == 0 { 96 } else { 192 };
+            let center = nquant / 2;
+            let gain_step = 820.0f32 / (4096.0 * (1 + quantization_table) as f32);
+            for data_point in 0..data_points {
+                let channels = &channel_indices[data_point];
+                let vector = &vectors[data_point];
+                if channels.len() != bands || vector.len() != bands {
+                    return Err(ParseError::InvalidHeader("joc_sparse_bands"));
+                }
+                // Sparse JOC carries one input-channel position and one
+                // differential coefficient for each parameter band. The first
+                // coefficient is centred, then later coefficients are coded as
+                // deltas in the same quantization domain as dense matrices.
+                let mut current = 0usize;
+                for band_index in 0..bands {
+                    let channel_index = channels[band_index] as usize;
+                    if channel_index >= channel_count {
+                        return Err(ParseError::InvalidHeader("joc_sparse_channel"));
+                    }
+                    let value = vector[band_index] as usize;
+                    current = if band_index == 0 {
+                        (center + value) % nquant
+                    } else {
+                        (current + value) % nquant
+                    };
+                    mix_matrix[data_point][channel_index][band_index] =
+                        (current as f32 - center as f32) * gain_step;
+                }
+            }
         }
     }
     Ok(())
@@ -844,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_joc_is_rejected_instead_of_silently_zeroed() {
+    fn sparse_joc_reconstructs_only_its_selected_input_channels() {
         let object = JocObject {
             active: true,
             bands_index: Some(1),
@@ -862,13 +891,17 @@ mod tests {
 
         let mut mix_matrix = [vec![[1.0; 64]; 5], vec![[2.0; 64]; 5]];
         let mut timeslot_offsets = [0; 2];
-        let error = decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
-            .expect_err("unverified sparse coding must not decode as silence");
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
+            .expect("sparse JOC parameter points");
 
-        assert_eq!(
-            error,
-            crate::AccessUnitParseError::UnsupportedFeature("joc-sparse")
-        );
+        let step = 820.0 / 4096.0;
+        assert!((mix_matrix[0][0][0] - 4.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[0][1][1] - 9.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[0][0][2] - 15.0 * step).abs() < 1e-6);
+        assert_eq!(mix_matrix[0][2][0], 0.0);
+        assert!((mix_matrix[1][1][0] - 7.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[1][0][1] - 15.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[1][1][2] - 24.0 * step).abs() < 1e-6);
     }
 
     #[test]
