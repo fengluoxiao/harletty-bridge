@@ -137,6 +137,14 @@ pub(crate) struct JocObjectDecoderState {
     analysis: Vec<QmfSubbands>,
     core_delay: CoreDelayState,
     last_frame_matrices: JocObjectMatrices,
+    /// Presentation smoothing of the reconstruction coefficients. JOC sparse
+    /// frames reset every unselected input to the offset baseline and the
+    /// selected channel can wrap to a large magnitude, which makes per-frame
+    /// object loudness jump audibly on dense material. The decoded samples stay
+    /// normative; this presentation low-pass runs on the worker at the frame
+    /// boundary and keeps the trajectory within one object-update interval.
+    smoothed_matrices: JocObjectMatrices,
+    smoothing_initialized: Vec<bool>,
     last_sequence_counter: Option<u16>,
     last_configuration: Option<(u8, usize, usize, u32, usize)>,
 }
@@ -158,6 +166,8 @@ impl JocObjectDecoderState {
         self.analysis.clear();
         self.core_delay.reset();
         self.last_frame_matrices.clear();
+        self.smoothed_matrices.clear();
+        self.smoothing_initialized.clear();
     }
 
     pub fn decode_frame(
@@ -208,6 +218,7 @@ impl JocObjectDecoderState {
         let timeslots = samples / QMF_SUBBANDS;
         self.reconfigure(joc.channel_count, joc.object_count);
         self.build_frame_matrices(joc, timeslots)?;
+        self.smooth_frame_matrices(joc.object_count, timeslots);
         prepare_object_output_buffers(objects, joc.object_count, samples);
         self.analysis.resize(joc.channel_count, QmfSubbands::zero());
         let analysis = &mut self.analysis[..joc.channel_count];
@@ -223,7 +234,7 @@ impl JocObjectDecoderState {
 
             for object_index in 0..joc.object_count {
                 let active = joc.objects[object_index].active;
-                let matrix = &self.last_frame_matrices[object_index][timeslot];
+                let matrix = &self.smoothed_matrices[object_index][timeslot];
                 let output =
                     &mut objects[object_index][sample_offset..sample_offset + QMF_SUBBANDS];
                 if !active && !self.inverse_history[object_index] {
@@ -347,6 +358,58 @@ impl JocObjectDecoderState {
             )?;
         }
         Ok(())
+    }
+
+    /// One-pole presentation smoothing per object/channel/subband across frames.
+    /// The time constant targets roughly one 32 ms object-update interval: fast
+    /// enough to keep panning motion, slow enough to turn the sparse-frame
+    /// coefficient steps into an inaudible ramp. The first frame after a reset
+    /// starts from the decoded coefficients so splices do not fade in.
+    fn smooth_frame_matrices(&mut self, object_count: usize, timeslots: usize) {
+        let alpha = 0.3_f32;
+        ensure_object_matrix_storage(
+            &mut self.smoothed_matrices,
+            object_count,
+            timeslots,
+            self.mix_matrix
+                .first()
+                .map_or(0, |object| object.first().map_or(0, |point| point.len())),
+        );
+        self.smoothing_initialized.resize(object_count, false);
+        if self.smoothing_initialized.len() > object_count {
+            self.smoothing_initialized.truncate(object_count);
+        }
+        for object_index in 0..object_count {
+            if !self.smoothing_initialized[object_index] {
+                for (timeslot, target) in self.last_frame_matrices[object_index].iter().enumerate()
+                {
+                    copy_matrix(&mut self.smoothed_matrices[object_index][timeslot], target);
+                }
+                self.smoothing_initialized[object_index] = true;
+                continue;
+            }
+            let previous_slot = timeslots - 1;
+            let previous = self.smoothed_matrices[object_index][previous_slot].clone();
+            for timeslot in 0..timeslots {
+                let previous = &previous;
+                let target = &self.last_frame_matrices[object_index][timeslot];
+                let smoothed = &mut self.smoothed_matrices[object_index][timeslot];
+                for (channel, (target_channel, previous_channel)) in
+                    target.iter().zip(previous.iter()).enumerate()
+                {
+                    let _ = channel;
+                    for (subband, (target_gain, previous_gain)) in target_channel
+                        .iter()
+                        .zip(previous_channel.iter())
+                        .enumerate()
+                    {
+                        let _ = subband;
+                        smoothed[channel][subband] =
+                            previous_gain + (target_gain - previous_gain) * alpha;
+                    }
+                }
+            }
+        }
     }
 }
 
