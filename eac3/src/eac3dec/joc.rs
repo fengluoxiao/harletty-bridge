@@ -242,11 +242,6 @@ impl JocObjectDecoderState {
                 }
 
                 self.inverse_qmf[object_index].process_inverse(&mixed, output);
-                if joc.gain != 1.0 {
-                    for sample in output.iter_mut() {
-                        *sample *= joc.gain;
-                    }
-                }
                 if active {
                     self.inverse_history[object_index] = true;
                 }
@@ -408,7 +403,12 @@ fn build_object_timeslots(
     output: &mut TimeslotMatrices,
 ) -> Result<(), ParseError> {
     if !object.active {
-        zero_timeslot_matrices(output);
+        // `b_joc_obj_present` means this access unit carries no new side
+        // information for the object. Keep its ordinal's prior matrix alive;
+        // after a splice that state is the required all-zero initialization.
+        for matrix in output.iter_mut() {
+            copy_matrix(matrix, prev_matrix);
+        }
         return Ok(());
     }
 
@@ -461,14 +461,6 @@ fn build_object_timeslots(
 
     update_prev_matrix(prev_matrix, &mix_matrix[object.data_points - 1], mapping);
     Ok(())
-}
-
-fn zero_timeslot_matrices(output: &mut TimeslotMatrices) {
-    for timeslot in output.iter_mut() {
-        for channel in timeslot.iter_mut() {
-            *channel = [0.0; QMF_SUBBANDS];
-        }
-    }
 }
 
 fn joc_input_order(downmix_config: u8) -> Result<&'static [BedChannel], ParseError> {
@@ -568,32 +560,39 @@ fn decode_parameter_points(
                 return Err(ParseError::InvalidHeader("joc_sparse_points"));
             }
             let nquant = if quantization_table == 0 { 96 } else { 192 };
+            let sparse_offset = if quantization_table == 0 { 50 } else { 100 };
             let center = nquant / 2;
             let gain_step = 820.0f32 / (4096.0 * (1 + quantization_table) as f32);
             for data_point in 0..data_points {
-                let channels = &channel_indices[data_point];
+                let raw_indices = &channel_indices[data_point];
                 let vector = &vectors[data_point];
-                if channels.len() != bands || vector.len() != bands {
+                if raw_indices.len() != bands || vector.len() != bands {
                     return Err(ParseError::InvalidHeader("joc_sparse_bands"));
                 }
-                // Sparse JOC carries one input-channel position and one
-                // differential coefficient for each parameter band. The first
-                // coefficient is centred, then later coefficients are coded as
-                // deltas in the same quantization domain as dense matrices.
-                let mut current = 0usize;
+                let mut quantized = vec![vec![sparse_offset; bands]; channel_count];
                 for band_index in 0..bands {
-                    let channel_index = channels[band_index] as usize;
+                    let channel_index = if band_index == 0 {
+                        raw_indices[0] as usize
+                    } else {
+                        (raw_indices[band_index - 1] as usize + raw_indices[band_index] as usize)
+                            % channel_count
+                    };
                     if channel_index >= channel_count {
                         return Err(ParseError::InvalidHeader("joc_sparse_channel"));
                     }
-                    let value = vector[band_index] as usize;
-                    current = if band_index == 0 {
-                        (center + value) % nquant
+                    let predictor = if band_index == 0 {
+                        sparse_offset
                     } else {
-                        (current + value) % nquant
+                        quantized[channel_index][band_index - 1]
                     };
-                    mix_matrix[data_point][channel_index][band_index] =
-                        (current as f32 - center as f32) * gain_step;
+                    quantized[channel_index][band_index] =
+                        (predictor + vector[band_index] as usize) % nquant;
+                }
+                for (channel_index, channel) in quantized.into_iter().enumerate() {
+                    for (band_index, value) in channel.into_iter().enumerate() {
+                        mix_matrix[data_point][channel_index][band_index] =
+                            (value as f32 - center as f32) * gain_step;
+                    }
                 }
             }
         }
@@ -873,7 +872,63 @@ mod tests {
     }
 
     #[test]
-    fn sparse_joc_reconstructs_only_its_selected_input_channels() {
+    fn clipgain_header_does_not_rescale_reconstructed_object_pcm() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+            ],
+            fullband_channels: vec![
+                (0..64).map(|sample| sample as f32 * 0.01).collect(),
+                (0..64).map(|sample| sample as f32 * -0.02).collect(),
+                (0..64).map(|sample| sample as f32 * 0.03).collect(),
+                (0..64).map(|sample| sample as f32 * -0.04).collect(),
+                (0..64).map(|sample| sample as f32 * 0.05).collect(),
+            ],
+            lfe_channel: None,
+        };
+        let object = JocObject {
+            active: true,
+            bands_index: Some(0),
+            bands: 1,
+            sparse_coded: false,
+            quantization_table: Some(0),
+            steep_slope: true,
+            data_points: 1,
+            timeslot_offsets: vec![0],
+            data: Some(JocObjectData::Dense {
+                matrices: vec![vec![vec![1], vec![0], vec![0], vec![0], vec![0]]],
+            }),
+        };
+        let base = JocPayload {
+            downmix_config: 0,
+            channel_count: 5,
+            object_count: 1,
+            gain: 1.0,
+            sequence_counter: 1,
+            objects: vec![object.clone()],
+        };
+        let amplified_header = JocPayload {
+            gain: 8.75,
+            ..base.clone()
+        };
+
+        let mut first = JocObjectDecoderState::default();
+        let mut second = JocObjectDecoderState::default();
+        let output = first.decode_frame(&core, &base).expect("base JOC PCM");
+        let output_with_clipgain = second
+            .decode_frame(&core, &amplified_header)
+            .expect("clipgain JOC PCM");
+        assert_eq!(output, output_with_clipgain);
+        assert!(output[0].iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn sparse_joc_uses_normative_offsets_and_raw_index_deltas() {
         let object = JocObject {
             active: true,
             bands_index: Some(1),
@@ -895,13 +950,53 @@ mod tests {
             .expect("sparse JOC parameter points");
 
         let step = 820.0 / 4096.0;
-        assert!((mix_matrix[0][0][0] - 4.0 * step).abs() < 1e-6);
-        assert!((mix_matrix[0][1][1] - 9.0 * step).abs() < 1e-6);
-        assert!((mix_matrix[0][0][2] - 15.0 * step).abs() < 1e-6);
-        assert_eq!(mix_matrix[0][2][0], 0.0);
-        assert!((mix_matrix[1][1][0] - 7.0 * step).abs() < 1e-6);
-        assert!((mix_matrix[1][0][1] - 15.0 * step).abs() < 1e-6);
-        assert!((mix_matrix[1][1][2] - 24.0 * step).abs() < 1e-6);
+        let neutral = 2.0 * step;
+        // Point zero: raw positions [0, 1, 0] select channels [0, 1, 1].
+        assert!((mix_matrix[0][0][0] - 6.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[0][1][1] - 7.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[0][1][2] - 13.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[0][2][0] - neutral).abs() < 1e-6);
+        // Point one: raw positions [1, 0, 1] select channel 1 at every band.
+        assert!((mix_matrix[1][1][0] - 9.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[1][1][1] - 17.0 * step).abs() < 1e-6);
+        assert!((mix_matrix[1][1][2] - 26.0 * step).abs() < 1e-6);
+    }
+
+    #[test]
+    fn absent_side_information_reuses_its_own_previous_matrix() {
+        let absent = JocObject {
+            active: false,
+            bands_index: None,
+            bands: 0,
+            sparse_coded: false,
+            quantization_table: None,
+            steep_slope: false,
+            data_points: 0,
+            timeslot_offsets: Vec::new(),
+            data: None,
+        };
+        let mut prev_matrix = vec![[0.0; 64], [0.0; 64]];
+        prev_matrix[0].fill(0.25);
+        prev_matrix[1].fill(-0.5);
+        let mix_matrix = [vec![[9.0; 64]; 2], vec![[8.0; 64]; 2]];
+        let mut output = vec![vec![[0.0; 64]; 2]; 3];
+
+        build_object_timeslots(
+            &mut prev_matrix,
+            &mix_matrix,
+            [0; 2],
+            &absent,
+            3,
+            &mut output,
+        )
+        .expect("absent JOC side information");
+
+        for timeslot in &output {
+            assert!(timeslot[0].iter().all(|value| *value == 0.25));
+            assert!(timeslot[1].iter().all(|value| *value == -0.5));
+        }
+        assert!(prev_matrix[0].iter().all(|value| *value == 0.25));
+        assert!(prev_matrix[1].iter().all(|value| *value == -0.5));
     }
 
     #[test]

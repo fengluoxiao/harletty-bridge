@@ -125,6 +125,9 @@ pub struct JocPayload {
     pub downmix_config: u8,
     pub channel_count: usize,
     pub object_count: usize,
+    /// Parsed `joc_clipgain` header value. ETSI TS 103 420 defines its
+    /// representation but does not include it in the normative JOC
+    /// reconstruction matrix calculation.
     pub gain: f32,
     pub sequence_counter: u16,
     pub objects: Vec<JocObject>,
