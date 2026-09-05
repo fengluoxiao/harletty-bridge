@@ -137,14 +137,6 @@ pub(crate) struct JocObjectDecoderState {
     analysis: Vec<QmfSubbands>,
     core_delay: CoreDelayState,
     last_frame_matrices: JocObjectMatrices,
-    /// Presentation smoothing of the reconstruction coefficients. JOC sparse
-    /// frames reset every unselected input to the offset baseline and the
-    /// selected channel can wrap to a large magnitude, which makes per-frame
-    /// object loudness jump audibly on dense material. The decoded samples stay
-    /// normative; this presentation low-pass runs on the worker at the frame
-    /// boundary and keeps the trajectory within one object-update interval.
-    smoothed_matrices: JocObjectMatrices,
-    smoothing_initialized: Vec<bool>,
     last_sequence_counter: Option<u16>,
     last_configuration: Option<(u8, usize, usize, u32, usize)>,
 }
@@ -166,8 +158,6 @@ impl JocObjectDecoderState {
         self.analysis.clear();
         self.core_delay.reset();
         self.last_frame_matrices.clear();
-        self.smoothed_matrices.clear();
-        self.smoothing_initialized.clear();
     }
 
     pub fn decode_frame(
@@ -217,8 +207,9 @@ impl JocObjectDecoderState {
         let input_indices = map_input_channel_indices(core, input_order)?;
         let timeslots = samples / QMF_SUBBANDS;
         self.reconfigure(joc.channel_count, joc.object_count);
+        // These matrices already contain the signaled timeslot interpolation;
+        // another frame-rate filter delays object gains and adds boundary steps.
         self.build_frame_matrices(joc, timeslots)?;
-        self.smooth_frame_matrices(joc.object_count, timeslots);
         prepare_object_output_buffers(objects, joc.object_count, samples);
         self.analysis.resize(joc.channel_count, QmfSubbands::zero());
         let analysis = &mut self.analysis[..joc.channel_count];
@@ -234,7 +225,7 @@ impl JocObjectDecoderState {
 
             for object_index in 0..joc.object_count {
                 let active = joc.objects[object_index].active;
-                let matrix = &self.smoothed_matrices[object_index][timeslot];
+                let matrix = &self.last_frame_matrices[object_index][timeslot];
                 let output =
                     &mut objects[object_index][sample_offset..sample_offset + QMF_SUBBANDS];
                 if !active && !self.inverse_history[object_index] {
@@ -358,58 +349,6 @@ impl JocObjectDecoderState {
             )?;
         }
         Ok(())
-    }
-
-    /// One-pole presentation smoothing per object/channel/subband across frames.
-    /// The time constant targets roughly one 32 ms object-update interval: fast
-    /// enough to keep panning motion, slow enough to turn the sparse-frame
-    /// coefficient steps into an inaudible ramp. The first frame after a reset
-    /// starts from the decoded coefficients so splices do not fade in.
-    fn smooth_frame_matrices(&mut self, object_count: usize, timeslots: usize) {
-        let alpha = 0.3_f32;
-        ensure_object_matrix_storage(
-            &mut self.smoothed_matrices,
-            object_count,
-            timeslots,
-            self.mix_matrix
-                .first()
-                .map_or(0, |object| object.first().map_or(0, |point| point.len())),
-        );
-        self.smoothing_initialized.resize(object_count, false);
-        if self.smoothing_initialized.len() > object_count {
-            self.smoothing_initialized.truncate(object_count);
-        }
-        for object_index in 0..object_count {
-            if !self.smoothing_initialized[object_index] {
-                for (timeslot, target) in self.last_frame_matrices[object_index].iter().enumerate()
-                {
-                    copy_matrix(&mut self.smoothed_matrices[object_index][timeslot], target);
-                }
-                self.smoothing_initialized[object_index] = true;
-                continue;
-            }
-            let previous_slot = timeslots - 1;
-            let previous = self.smoothed_matrices[object_index][previous_slot].clone();
-            for timeslot in 0..timeslots {
-                let previous = &previous;
-                let target = &self.last_frame_matrices[object_index][timeslot];
-                let smoothed = &mut self.smoothed_matrices[object_index][timeslot];
-                for (channel, (target_channel, previous_channel)) in
-                    target.iter().zip(previous.iter()).enumerate()
-                {
-                    let _ = channel;
-                    for (subband, (target_gain, previous_gain)) in target_channel
-                        .iter()
-                        .zip(previous_channel.iter())
-                        .enumerate()
-                    {
-                        let _ = subband;
-                        smoothed[channel][subband] =
-                            previous_gain + (target_gain - previous_gain) * alpha;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -751,9 +690,10 @@ fn update_prev_matrix(
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreDelayState, JOC_QMF_LATENCY_SAMPLES, JocObjectDecoderState, SampleDelay,
-        build_object_timeslots, decode_parameter_points, expanded_parameter_band_mapping,
-        joc_input_order, joc_sequence_is_contiguous, map_input_channel_indices,
+        CoreDelayState, JOC_QMF_LATENCY_SAMPLES, JocObjectDecoderState, QMF_SUBBANDS,
+        QuadratureMirrorFilterBank, SampleDelay, build_object_timeslots, decode_parameter_points,
+        expanded_parameter_band_mapping, joc_input_order, joc_sequence_is_contiguous,
+        map_input_channel_indices,
     };
     use crate::{BedChannel, CorePcmFrame, JocObject, JocObjectData, JocPayload};
 
@@ -988,6 +928,94 @@ mod tests {
             .expect("clipgain JOC PCM");
         assert_eq!(output, output_with_clipgain);
         assert!(output[0].iter().any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn decoded_pcm_preserves_signaled_object_gain_ramps_without_extra_frame_smoothing() {
+        const FRAME_SAMPLES: usize = 1536;
+        const TIMESLOTS: usize = FRAME_SAMPLES / QMF_SUBBANDS;
+        let mut core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: joc_input_order(0).unwrap().to_vec(),
+            fullband_channels: vec![vec![0.0; FRAME_SAMPLES]; 5],
+            lfe_channel: None,
+        };
+        let mut decoder = JocObjectDecoderState::default();
+        let mut analysis = QuadratureMirrorFilterBank::new();
+        let mut synthesis = [
+            QuadratureMirrorFilterBank::new(),
+            QuadratureMirrorFilterBank::new(),
+        ];
+        let mut previous_gain = [0.0_f32; 2];
+
+        // Move a continuous tone between two independent objects, hold it,
+        // then redistribute it. The held frames must not keep chasing a gain.
+        let coefficient_frames = [[0_u16, 0], [5, 0], [0, 5], [0, 5], [1, 4], [1, 4]];
+        for (frame_index, coefficients) in coefficient_frames.iter().enumerate() {
+            for (sample, value) in core.fullband_channels[0].iter_mut().enumerate() {
+                let time = (frame_index * FRAME_SAMPLES + sample) as f32 / 48_000.0;
+                *value = 0.1 * (std::f32::consts::TAU * 1_000.0 * time).sin();
+            }
+            let joc = JocPayload {
+                downmix_config: 0,
+                channel_count: 5,
+                object_count: 2,
+                gain: 1.0,
+                sequence_counter: frame_index as u16 + 1,
+                objects: coefficients
+                    .iter()
+                    .map(|&coefficient| JocObject {
+                        active: true,
+                        bands_index: Some(0),
+                        bands: 1,
+                        sparse_coded: false,
+                        quantization_table: Some(0),
+                        steep_slope: false,
+                        data_points: 1,
+                        timeslot_offsets: Vec::new(),
+                        data: Some(JocObjectData::Dense {
+                            matrices: vec![vec![
+                                vec![coefficient],
+                                vec![0],
+                                vec![0],
+                                vec![0],
+                                vec![0],
+                            ]],
+                        }),
+                    })
+                    .collect(),
+            };
+            let actual = decoder.decode_frame(&core, &joc).expect("object PCM");
+            let targets = coefficients.map(|value| value as f32 * (820.0 / 4096.0));
+            let mut expected = [vec![0.0; FRAME_SAMPLES], vec![0.0; FRAME_SAMPLES]];
+            for timeslot in 0..TIMESLOTS {
+                let start = timeslot * QMF_SUBBANDS;
+                let end = start + QMF_SUBBANDS;
+                let input = analysis.process_forward(&core.fullband_channels[0][start..end]);
+                for object in 0..2 {
+                    let fraction = (timeslot + 1) as f32 / TIMESLOTS as f32;
+                    let gain = previous_gain[object]
+                        + (targets[object] - previous_gain[object]) * fraction;
+                    let mut mixed = input.clone();
+                    for value in mixed.real.iter_mut().chain(mixed.imaginary.iter_mut()) {
+                        *value *= gain;
+                    }
+                    synthesis[object].process_inverse(&mixed, &mut expected[object][start..end]);
+                }
+            }
+            for object in 0..2 {
+                let max_error = actual[object]
+                    .iter()
+                    .zip(&expected[object])
+                    .map(|(actual, expected)| (actual - expected).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_error < 1e-6,
+                    "frame {frame_index} object {object}: PCM error {max_error}"
+                );
+            }
+            previous_gain = targets;
+        }
     }
 
     #[test]
