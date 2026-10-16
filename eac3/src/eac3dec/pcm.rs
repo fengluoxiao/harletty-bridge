@@ -117,6 +117,12 @@ pub struct ObjectPcmFrame {
 }
 
 impl ObjectPcmFrame {
+    /// Sample delay shared by object PCM, companion core/LFE, and OAMD events.
+    /// Callers must use this per-frame value rather than the base QMF constant.
+    pub fn processing_latency_samples(&self) -> usize {
+        super::joc::processing_latency_samples(&self.core, &self.joc)
+    }
+
     /// Number of samples carried by each decoded channel in this frame.
     pub fn samples_per_channel(&self) -> usize {
         self.core.samples_per_channel()

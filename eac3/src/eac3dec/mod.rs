@@ -9,6 +9,7 @@ mod joc;
 mod metadata;
 mod pcm;
 mod qmf;
+mod joc_input;
 mod syncframe;
 
 pub use decoder::{Decoder, PushResult};

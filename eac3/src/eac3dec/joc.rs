@@ -4,6 +4,7 @@
 
 use std::sync::OnceLock;
 
+use super::joc_input::{INPUT_DELAY_SAMPLES, JocInputConditioner};
 use super::metadata::{JocObject, JocObjectData, JocPayload};
 use super::pcm::CorePcmFrame;
 use super::qmf::{QMF_SUBBANDS, QmfSubbands, QuadratureMirrorFilterBank};
@@ -39,8 +40,21 @@ const JOC_INPUT_5_X_2: [BedChannel; 7] = [
 ];
 
 /// Observable analysis+synthesis latency of the normative 64-band complex QMF.
-/// Object PCM and its core/LFE companions must share this delay.
+/// Base delay only; ObjectPcmFrame::processing_latency_samples also includes
+/// format-scoped input conditioning when enabled.
 pub const JOC_QMF_LATENCY_SAMPLES: usize = 577;
+
+pub(super) fn processing_latency_samples(core: &CorePcmFrame, joc: &JocPayload) -> usize {
+    if core.sample_rate == 48_000
+        && core.fullband_channels.len() == 5
+        && joc.downmix_config == 3
+        && joc.channel_count == 5
+    {
+        JOC_QMF_LATENCY_SAMPLES + INPUT_DELAY_SAMPLES
+    } else {
+        JOC_QMF_LATENCY_SAMPLES
+    }
+}
 
 const JOC_PARAMETER_BAND_BOUNDARIES: [&[u8]; 8] = [
     &[0],
@@ -64,25 +78,31 @@ type TimeslotMatrices = JocTimeslotMatrices;
 
 #[derive(Debug)]
 struct SampleDelay {
-    history: [f32; JOC_QMF_LATENCY_SAMPLES],
+    history: Vec<f32>,
     cursor: usize,
 }
 
 impl Default for SampleDelay {
     fn default() -> Self {
         Self {
-            history: [0.0; JOC_QMF_LATENCY_SAMPLES],
+            history: vec![0.0; JOC_QMF_LATENCY_SAMPLES],
             cursor: 0,
         }
     }
 }
 
 impl SampleDelay {
+    fn with_latency(samples: usize) -> Self {
+        Self {
+            history: vec![0.0; samples],
+            cursor: 0,
+        }
+    }
     fn process(&mut self, samples: &mut [f32]) {
         for sample in samples {
             std::mem::swap(sample, &mut self.history[self.cursor]);
             self.cursor += 1;
-            if self.cursor == JOC_QMF_LATENCY_SAMPLES {
+            if self.cursor == self.history.len() {
                 self.cursor = 0;
             }
         }
@@ -91,6 +111,7 @@ impl SampleDelay {
 
 #[derive(Debug, Default)]
 struct CoreDelayState {
+    latency: usize,
     sample_rate: Option<u32>,
     layout: Vec<BedChannel>,
     fullband: Vec<SampleDelay>,
@@ -102,19 +123,21 @@ impl CoreDelayState {
         *self = Self::default();
     }
 
-    fn process(&mut self, core: &mut CorePcmFrame) {
+    fn process(&mut self, core: &mut CorePcmFrame, latency: usize) {
         let lfe_present = core.lfe_channel.is_some();
-        if self.sample_rate != Some(core.sample_rate)
+        if self.latency != latency
+            || self.sample_rate != Some(core.sample_rate)
             || self.layout != core.fullband_channel_order
             || self.fullband.len() != core.fullband_channels.len()
             || self.lfe.is_some() != lfe_present
         {
+            self.latency = latency;
             self.sample_rate = Some(core.sample_rate);
             self.layout.clone_from(&core.fullband_channel_order);
             self.fullband = (0..core.fullband_channels.len())
-                .map(|_| SampleDelay::default())
+                .map(|_| SampleDelay::with_latency(latency))
                 .collect();
-            self.lfe = lfe_present.then(SampleDelay::default);
+            self.lfe = lfe_present.then(|| SampleDelay::with_latency(latency));
         }
 
         for (delay, channel) in self.fullband.iter_mut().zip(&mut core.fullband_channels) {
@@ -136,6 +159,8 @@ pub(crate) struct JocObjectDecoderState {
     inverse_history: Vec<bool>,
     analysis: Vec<QmfSubbands>,
     core_delay: CoreDelayState,
+    input_conditioner: JocInputConditioner,
+    input_conditioning_enabled: bool,
     last_frame_matrices: JocObjectMatrices,
     last_sequence_counter: Option<u16>,
     last_configuration: Option<(u8, usize, usize, u32, usize)>,
@@ -157,6 +182,8 @@ impl JocObjectDecoderState {
         self.inverse_history.clear();
         self.analysis.clear();
         self.core_delay.reset();
+        self.input_conditioner.reset();
+        self.input_conditioning_enabled = false;
         self.last_frame_matrices.clear();
     }
 
@@ -185,6 +212,7 @@ impl JocObjectDecoderState {
             return Err(ParseError::InvalidHeader("joc-frame-samples"));
         }
 
+        let conditioning_enabled = processing_latency_samples(core, joc) > JOC_QMF_LATENCY_SAMPLES;
         let configuration = (
             joc.downmix_config,
             joc.channel_count,
@@ -195,12 +223,16 @@ impl JocObjectDecoderState {
         let sequence_continues = self
             .last_sequence_counter
             .is_some_and(|previous| joc_sequence_is_contiguous(previous, joc.sequence_counter));
-        if !sequence_continues || self.last_configuration != Some(configuration) {
+        if !sequence_continues
+            || self.last_configuration != Some(configuration)
+            || self.input_conditioning_enabled != conditioning_enabled
+        {
             // A zero/discontinuous sequence counter marks the first frame after a
             // splice. Matrix interpolation and both QMF banks must start without
             // history from the preceding segment (ETSI TS 103 420 §6.3.3.3).
             self.clear_reconstruction_state();
         }
+        self.input_conditioning_enabled = conditioning_enabled;
         self.last_sequence_counter = Some(joc.sequence_counter);
         self.last_configuration = Some(configuration);
 
@@ -209,7 +241,7 @@ impl JocObjectDecoderState {
         self.reconfigure(joc.channel_count, joc.object_count);
         // These matrices already contain the signaled timeslot interpolation;
         // another frame-rate filter delays object gains and adds boundary steps.
-        self.build_frame_matrices(joc, timeslots)?;
+        self.build_frame_matrices(joc, timeslots, conditioning_enabled)?;
         prepare_object_output_buffers(objects, joc.object_count, samples);
         self.analysis.resize(joc.channel_count, QmfSubbands::zero());
         let analysis = &mut self.analysis[..joc.channel_count];
@@ -221,6 +253,10 @@ impl JocObjectDecoderState {
                     &core.fullband_channels[*core_channel]
                         [sample_offset..sample_offset + QMF_SUBBANDS],
                 );
+            }
+
+            if conditioning_enabled {
+                self.input_conditioner.process(analysis);
             }
 
             for object_index in 0..joc.object_count {
@@ -254,7 +290,13 @@ impl JocObjectDecoderState {
     }
 
     pub fn delay_core_frame(&mut self, core: &mut CorePcmFrame) {
-        self.core_delay.process(core);
+        let latency = JOC_QMF_LATENCY_SAMPLES
+            + if self.input_conditioning_enabled {
+                INPUT_DELAY_SAMPLES
+            } else {
+                0
+            };
+        self.core_delay.process(core, latency);
     }
 
     pub fn last_frame_matrices(&self) -> &JocObjectMatrices {
@@ -323,6 +365,7 @@ impl JocObjectDecoderState {
         &mut self,
         joc: &JocPayload,
         timeslots: usize,
+        cumulative_sparse: bool,
     ) -> Result<(), ParseError> {
         ensure_object_matrix_storage(
             &mut self.last_frame_matrices,
@@ -338,7 +381,13 @@ impl JocObjectDecoderState {
             let prev_matrix = &mut self.prev_matrix[object_index];
             let mix_matrix = &mut self.mix_matrix[object_index];
             let timeslot_offsets = &mut self.timeslot_offsets[object_index];
-            decode_parameter_points(mix_matrix, timeslot_offsets, object, joc.channel_count)?;
+            decode_parameter_points(
+                mix_matrix,
+                timeslot_offsets,
+                object,
+                joc.channel_count,
+                cumulative_sparse,
+            )?;
             build_object_timeslots(
                 prev_matrix,
                 mix_matrix,
@@ -494,6 +543,7 @@ fn decode_parameter_points(
     timeslot_offsets: &mut [u8; 2],
     object: &JocObject,
     channel_count: usize,
+    cumulative_sparse: bool,
 ) -> Result<(), ParseError> {
     // `mix_matrix` and offsets are persistent decoder scratch. Clear both data
     // point slots every frame so a one-point object can never consume the stale
@@ -571,10 +621,21 @@ fn decode_parameter_points(
                 if raw_indices.len() != bands || vector.len() != bands {
                     return Err(ParseError::InvalidHeader("joc_sparse_bands"));
                 }
-                let mut quantized = vec![vec![sparse_offset; bands]; channel_count];
+                // Unselected channels are zero in the conditioned path. One
+                // scalar and one reconstructed channel carry across bands.
+                let initial = if cumulative_sparse {
+                    center
+                } else {
+                    sparse_offset
+                };
+                let mut quantized = vec![vec![initial; bands]; channel_count];
+                let mut previous_channel = 0usize;
+                let mut scalar = sparse_offset;
                 for band_index in 0..bands {
                     let channel_index = if band_index == 0 {
                         raw_indices[0] as usize
+                    } else if cumulative_sparse {
+                        (previous_channel + raw_indices[band_index] as usize) % channel_count
                     } else {
                         (raw_indices[band_index - 1] as usize + raw_indices[band_index] as usize)
                             % channel_count
@@ -582,13 +643,16 @@ fn decode_parameter_points(
                     if channel_index >= channel_count {
                         return Err(ParseError::InvalidHeader("joc_sparse_channel"));
                     }
-                    let predictor = if band_index == 0 {
+                    previous_channel = channel_index;
+                    let predictor = if cumulative_sparse {
+                        scalar
+                    } else if band_index == 0 {
                         sparse_offset
                     } else {
                         quantized[channel_index][band_index - 1]
                     };
-                    quantized[channel_index][band_index] =
-                        (predictor + vector[band_index] as usize) % nquant;
+                    scalar = (predictor + vector[band_index] as usize) % nquant;
+                    quantized[channel_index][band_index] = scalar;
                 }
                 for (channel_index, channel) in quantized.into_iter().enumerate() {
                     for (band_index, value) in channel.into_iter().enumerate() {
@@ -726,7 +790,7 @@ mod tests {
             fullband_channels: vec![vec![1.0; JOC_QMF_LATENCY_SAMPLES]],
             lfe_channel: None,
         };
-        delay.process(&mut first);
+        delay.process(&mut first, JOC_QMF_LATENCY_SAMPLES);
         assert!(
             first.fullband_channels[0]
                 .iter()
@@ -739,7 +803,7 @@ mod tests {
             fullband_channels: vec![vec![2.0; 64]],
             lfe_channel: None,
         };
-        delay.process(&mut switched);
+        delay.process(&mut switched, JOC_QMF_LATENCY_SAMPLES);
 
         assert!(
             switched.fullband_channels[0]
@@ -1037,7 +1101,7 @@ mod tests {
 
         let mut mix_matrix = [vec![[1.0; 64]; 5], vec![[2.0; 64]; 5]];
         let mut timeslot_offsets = [0; 2];
-        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5, false)
             .expect("sparse JOC parameter points");
 
         let step = 820.0 / 4096.0;
@@ -1109,7 +1173,7 @@ mod tests {
         let mut prev_matrix = vec![[1.0; 64]];
         let mut mix_matrix = [vec![[9.0; 64]], vec![[9.0; 64]]];
         let mut timeslot_offsets = [9; 2];
-        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1, false)
             .expect("points");
         let mut output = vec![vec![[0.0; 64]]; 4];
         build_object_timeslots(
@@ -1156,7 +1220,7 @@ mod tests {
 
         let mut mix_matrix = [vec![[7.0; 64]], vec![[5.0; 64]]];
         let mut timeslot_offsets = [8, 3];
-        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &current, 1)
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &current, 1, false)
             .expect("current");
 
         assert_eq!(timeslot_offsets, [1, 0]);
@@ -1201,7 +1265,7 @@ mod tests {
 
         let mut mix_matrix = [vec![[0.0; 64]], vec![[0.0; 64]]];
         let mut timeslot_offsets = [0; 2];
-        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1, false)
             .expect("points");
         let mut prev_matrix = vec![[0.0; 64]];
         let mut output = vec![vec![[0.0; 64]]; 1];
@@ -1241,7 +1305,7 @@ mod tests {
 
         let mut mix_matrix = [vec![[0.0; 64]], vec![[0.0; 64]]];
         let mut timeslot_offsets = [0; 2];
-        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1, false)
             .expect("points");
 
         let expected = 820.0 / (4096.0 * 2.0);
@@ -1255,5 +1319,159 @@ mod tests {
         assert!(!joc_sequence_is_contiguous(12, 0));
         assert!(!joc_sequence_is_contiguous(12, 14));
         assert!(!joc_sequence_is_contiguous(1023, 2));
+    }
+}
+
+#[cfg(test)]
+mod conditioning_tests {
+    use super::*;
+    fn fixture() -> (CorePcmFrame, JocPayload) {
+        (
+            CorePcmFrame {
+                sample_rate: 48_000,
+                fullband_channel_order: JOC_INPUT_5_X.to_vec(),
+                fullband_channels: vec![vec![1.0; 64]; 5],
+                lfe_channel: Some(vec![1.0; 64]),
+            },
+            JocPayload {
+                downmix_config: 3,
+                channel_count: 5,
+                object_count: 1,
+                gain: 1.0,
+                sequence_counter: 1,
+                objects: vec![JocObject {
+                    active: true,
+                    bands_index: Some(0),
+                    bands: 1,
+                    sparse_coded: false,
+                    quantization_table: Some(0),
+                    steep_slope: false,
+                    data_points: 1,
+                    timeslot_offsets: vec![],
+                    data: Some(JocObjectData::Dense {
+                        matrices: vec![vec![vec![5], vec![0], vec![0], vec![0], vec![0]]],
+                    }),
+                }],
+            },
+        )
+    }
+    #[test]
+    fn conditioning_latency_is_scoped_to_the_validated_input_format() {
+        let (mut core, mut joc) = fixture();
+        assert_eq!(processing_latency_samples(&core, &joc), 1217);
+        for config in [0, 1, 2, 4, 5] {
+            joc.downmix_config = config;
+            assert_eq!(processing_latency_samples(&core, &joc), 577);
+        }
+        joc.downmix_config = 3;
+        core.sample_rate = 44_100;
+        assert_eq!(processing_latency_samples(&core, &joc), 577);
+        core.sample_rate = 48_000;
+        joc.channel_count = 7;
+        assert_eq!(processing_latency_samples(&core, &joc), 577);
+        joc.channel_count = 5;
+        core.fullband_channels.push(vec![0.0; 64]);
+        assert_eq!(processing_latency_samples(&core, &joc), 577);
+    }
+    #[test]
+    fn conditioned_sparse_accumulates_channel_and_scalar_and_zeros_unselected_cells() {
+        for table in [0u8, 1] {
+            let object = JocObject {
+                active: true,
+                bands_index: Some(1),
+                bands: 3,
+                sparse_coded: true,
+                quantization_table: Some(table),
+                steep_slope: false,
+                data_points: 2,
+                timeslot_offsets: vec![],
+                data: Some(JocObjectData::Sparse {
+                    channel_indices: vec![vec![1, 1, 1], vec![1, 4, 4]],
+                    vectors: vec![vec![4, 5, 6], vec![7, 8, 9]],
+                }),
+            };
+            let mut matrix = [vec![[99.0; 64]; 5], vec![[99.0; 64]; 5]];
+            let mut offsets = [0; 2];
+            decode_parameter_points(&mut matrix, &mut offsets, &object, 5, true).unwrap();
+            let extra = if table == 0 { 0.0 } else { 2.0 };
+            let step = 820.0 / (4096.0 * (1 + table) as f32);
+            let selected = [[1, 2, 3], [1, 0, 4]];
+            let values = [
+                [6.0 + extra, 11.0 + extra, 17.0 + extra],
+                [9.0 + extra, 17.0 + extra, 26.0 + extra],
+            ];
+            for point in 0..2 {
+                for band in 0..3 {
+                    for channel in 0..5 {
+                        let expected = if channel == selected[point][band] {
+                            values[point][band] * step
+                        } else {
+                            0.0
+                        };
+                        assert!((matrix[point][channel][band] - expected).abs() < 1e-6);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn companion_delay_tracks_latency_and_clears_on_policy_switch() {
+        let (core, _) = fixture();
+        let mut delay = CoreDelayState::default();
+        let mut out = Vec::new();
+        for _ in 0..24 {
+            let mut block = core.clone();
+            delay.process(&mut block, 1217);
+            assert_eq!(
+                block.fullband_channels[0],
+                *block.lfe_channel.as_ref().unwrap()
+            );
+            out.extend(block.fullband_channels[0].iter().copied());
+        }
+        assert!(out[..1217].iter().all(|v| *v == 0.0));
+        assert_eq!(out[1217], 1.0);
+        let mut switched = core;
+        delay.process(&mut switched, 577);
+        assert!(switched.fullband_channels[0].iter().all(|v| *v == 0.0));
+    }
+    #[test]
+    fn decoder_reset_and_sequence_gap_drop_conditioning_history() {
+        for explicit_reset in [false, true] {
+            let (core, mut joc) = fixture();
+            let mut used = JocObjectDecoderState::default();
+            for seq in 1..40 {
+                joc.sequence_counter = seq;
+                used.decode_frame(&core, &joc).unwrap();
+                let mut companion = core.clone();
+                used.delay_core_frame(&mut companion);
+            }
+            if explicit_reset {
+                used.reset();
+            }
+            let mut fresh = JocObjectDecoderState::default();
+            for seq in 1..30 {
+                joc.sequence_counter = seq;
+                let a = used.decode_frame(&core, &joc).unwrap();
+                let b = fresh.decode_frame(&core, &joc).unwrap();
+                assert_eq!(a, b);
+                let mut a = core.clone();
+                let mut b = core.clone();
+                used.delay_core_frame(&mut a);
+                fresh.delay_core_frame(&mut b);
+                assert_eq!(a.fullband_channels, b.fullband_channels);
+                assert_eq!(a.lfe_channel, b.lfe_channel);
+            }
+        }
+    }
+    #[test]
+    fn dense_matrix_arithmetic_is_identical_in_both_policies() {
+        let (_, joc) = fixture();
+        let mut a = JocObjectDecoderState::default();
+        let mut b = JocObjectDecoderState::default();
+        a.reconfigure(5, 1);
+        b.reconfigure(5, 1);
+        a.build_frame_matrices(&joc, 1, false).unwrap();
+        b.build_frame_matrices(&joc, 1, true).unwrap();
+        assert_eq!(a.last_frame_matrices, b.last_frame_matrices);
     }
 }
