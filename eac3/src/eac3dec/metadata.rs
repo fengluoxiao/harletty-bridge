@@ -53,8 +53,27 @@ impl ParsedEmdfPayloadData {
     }
 }
 
+/// Bounded OAMD trim element (ETSI TS 103 420 5.5.12).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OamdTrimConfiguration {
+    pub mode: u8,
+    pub centre_db: Option<f32>,
+    pub surround_db: Option<f32>,
+    pub height_db: Option<f32>,
+    pub top_bottom_y: Option<f32>,
+    pub listener_y: Option<f32>,
+}
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OamdTrimElement {
+    pub warp_mode: u8,
+    pub global_mode: u8,
+    pub configurations: Vec<OamdTrimConfiguration>,
+    pub disabled_objects: Vec<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OamdPayload {
+    pub trim: Option<OamdTrimElement>,
     pub version: u8,
     pub object_count: usize,
     pub alternate_object_present: bool,
@@ -79,6 +98,7 @@ pub struct OamdElement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OamdElementKind {
     Unknown,
+    Trim(OamdTrimElement),
     Object(OamdObjectElement),
 }
 
@@ -209,6 +229,8 @@ impl MetadataParseState {
 
 #[derive(Debug, Clone, Default)]
 struct OamdPayloadParseState {
+    trim: Option<OamdTrimElement>,
+    object_count: usize,
     elements: Vec<OamdElementParseState>,
 }
 
@@ -281,11 +303,17 @@ pub(crate) fn parse_emdf_payload_body_with_state(
 
 impl OamdPayloadParseState {
     fn resolve_payload(&mut self, payload: &mut OamdPayload) {
-        if self.elements.len() != payload.element_count {
-            self.elements = vec![OamdElementParseState::default(); payload.element_count];
+        if self.object_count != payload.object_count { self.trim = None; self.object_count = payload.object_count; }
+        if let Some(trim) = &payload.trim { self.trim = Some(trim.clone()); }
+        else { payload.trim = self.trim.clone(); }
+        // Optional trim/extension elements must not renumber or reset the
+        // differential object state when they appear or disappear.
+        let object_elements = payload.elements.iter().filter(|e|matches!(e.kind,OamdElementKind::Object(_))).count();
+        if object_elements > 0 && self.elements.len() != object_elements {
+            self.elements = vec![OamdElementParseState::default(); object_elements];
         }
 
-        for (slot, element) in payload.elements.iter_mut().enumerate() {
+        for (slot, element) in payload.elements.iter_mut().filter(|e|matches!(e.kind,OamdElementKind::Object(_))).enumerate() {
             self.elements[slot].resolve_element(
                 element,
                 payload.object_count,
@@ -584,7 +612,9 @@ fn parse_oamd_payload(reader: &mut BitReader<'_>) -> Result<OamdPayload, ParseEr
         bed_assignment = Vec::new();
     }
 
+    let trim = elements.iter().find_map(|e| if let OamdElementKind::Trim(t) = &e.kind { Some(t.clone()) } else { None });
     Ok(OamdPayload {
+        trim,
         version,
         object_count,
         alternate_object_present,
@@ -702,6 +732,16 @@ fn parse_oamd_element(
             object_count,
             bed_or_isf_objects,
         )?)
+    } else if element_index == 2 {
+        let mut bounded = *reader;
+        bounded.set_limit_bits(end_pos);
+        match parse_oamd_trim_element(&mut bounded, object_count) {
+            Ok(trim) => OamdElementKind::Trim(trim),
+            Err(error) => {
+                emit_metadata_debug(format_args!("unsupported bounded OAMD trim: {error:?}"));
+                OamdElementKind::Unknown
+            }
+        }
     } else {
         OamdElementKind::Unknown
     };
@@ -721,6 +761,50 @@ fn parse_oamd_element(
         byte_length,
         kind,
     })
+}
+
+fn parse_oamd_trim_element(reader: &mut BitReader<'_>, object_count: usize) -> Result<OamdTrimElement, ParseError> {
+    const CENTRE: [f32; 16] = [6.,3.,1.5,0.75,-0.75,-1.5,-3.,-4.5,-6.,-7.5,-9.,-10.5,-12.,-13.5,-16.,-36.];
+    const CONFIGURATIONS: usize = 9; // ETSI TS 103 190-2 OAMD trim profile.
+    let mut trim = OamdTrimElement::default();
+    trim.warp_mode = read_bits(reader,2,"trim_warp")? as u8;
+    if trim.warp_mode > 1 || read_bits(reader,2,"trim_reserved")? != 0 { return Err(ParseError::InvalidHeader("trim_reserved")); }
+    trim.global_mode = read_bits(reader,2,"global_trim_mode")? as u8;
+    if trim.global_mode > 2 { return Err(ParseError::InvalidHeader("trim_global_mode")); }
+    if trim.global_mode == 2 {
+        for _ in 0..CONFIGURATIONS {
+            let mut c = OamdTrimConfiguration::default();
+            if read_bits(reader,1,"trim_default")? == 0 {
+                c.mode = 1;
+                if read_bits(reader,1,"trim_disable")? == 0 {
+                    c.mode = 2;
+                    let flags = read_bits(reader,5,"trim_presence")?;
+                    for (mask, field, surround) in [(16,&mut c.centre_db,false),(8,&mut c.surround_db,true),(4,&mut c.height_db,true)] {
+                        if flags & mask != 0 {
+                            let code = read_bits(reader,4,"trim_code")? as usize;
+                            if surround && code < 4 { return Err(ParseError::InvalidHeader("trim_reserved_gain")); }
+                            *field = Some(CENTRE[code]);
+                        }
+                    }
+                    for (mask, field) in [(2,&mut c.top_bottom_y),(1,&mut c.listener_y)] {
+                        if flags & mask != 0 {
+                            let sign = if read_bits(reader,1,"trim_y_sign")? == 1 {1.} else {-1.};
+                            *field = Some(sign * (read_bits(reader,4,"trim_y_amount")? + 1) as f32 / 16.);
+                        }
+                    }
+                }
+            }
+            trim.configurations.push(c);
+        }
+    }
+    if read_bits(reader,1,"disable_trim_per_object")? != 0 {
+        if object_count > 128 { return Err(ParseError::InvalidHeader("trim_object_limit")); }
+        for _ in 0..object_count { trim.disabled_objects.push(read_bits(reader,1,"object_trim_disabled")? != 0); }
+    }
+    while reader.bits_left(1) {
+        if read_bits(reader,1,"trim_padding")? != 0 { return Err(ParseError::InvalidHeader("trim_nonzero_padding")); }
+    }
+    Ok(trim)
 }
 
 fn parse_oamd_object_element(
@@ -1988,6 +2072,7 @@ mod tests {
     fn payload_with_object_blocks(object_blocks: Vec<Vec<OamdObjectBlock>>) -> OamdPayload {
         let block_count = object_blocks.first().map(Vec::len).unwrap_or(0);
         OamdPayload {
+            trim: None,
             version: 0,
             object_count: object_blocks.len(),
             alternate_object_present: false,
@@ -2337,4 +2422,55 @@ mod tests {
         assert_eq!(inactive.screen_factor, None);
         assert_eq!(inactive.depth_factor, None);
     }
+    fn trim_bits(mask:u32,code:u32,width:usize)->Vec<bool> {
+        let mut bits=Vec::new();push_bits(&mut bits,0,2);push_bits(&mut bits,0,2);push_bits(&mut bits,2,2);
+        push_bits(&mut bits,0,1);push_bits(&mut bits,0,1);push_bits(&mut bits,mask,5);push_bits(&mut bits,code,width);
+        for _ in 1..9 {push_bits(&mut bits,1,1);}
+        push_bits(&mut bits,1,1);for i in 0..3 {push_bits(&mut bits,u32::from(i==1),1);}
+        bits
+    }
+    #[test]
+    fn oamd_trim_presence_bits_luts_and_per_object_flags_follow_the_spec() {
+        for (mask,code,width) in [(16,0,4),(8,6,4),(4,14,4),(2,17,5),(1,15,5)] {
+            let bits=trim_bits(mask,code,width);let bytes=bits_to_bytes(&bits);let mut reader=BitReader::new(&bytes);reader.set_limit_bits(bits.len());
+            let trim=parse_oamd_trim_element(&mut reader,3).unwrap();let c=&trim.configurations[0];
+            assert_eq!(trim.configurations.len(),9);assert_eq!(trim.disabled_objects,vec![false,true,false]);
+            assert_eq!(c.centre_db,if mask==16 {Some(6.)} else {None});
+            assert_eq!(c.surround_db,if mask==8 {Some(-3.)} else {None});
+            assert_eq!(c.height_db,if mask==4 {Some(-16.)} else {None});
+            assert_eq!(c.top_bottom_y,if mask==2 {Some(0.125)} else {None});
+            assert_eq!(c.listener_y,if mask==1 {Some(-1.)} else {None});
+        }
+    }
+    #[test]
+    fn oamd_trim_rejects_reserved_codes_and_truncation_without_reading_next_element() {
+        for mask in [8,4] {
+            let bits=trim_bits(mask,0,4);let bytes=bits_to_bytes(&bits);let mut reader=BitReader::new(&bytes);reader.set_limit_bits(bits.len());
+            assert!(parse_oamd_trim_element(&mut reader,3).is_err());
+        }
+        let bits=trim_bits(16,0,4);let bytes=bits_to_bytes(&bits);let mut reader=BitReader::new(&bytes);reader.set_limit_bits(bits.len()-1);
+        assert!(parse_oamd_trim_element(&mut reader,3).is_err());
+        let mut outer=Vec::new();push_bits(&mut outer,2,4);push_bits(&mut outer,0,4);push_bits(&mut outer,0,1);push_bits(&mut outer,0,8);push_bits(&mut outer,13,4);
+        let bytes=bits_to_bytes(&outer);let mut reader=BitReader::new(&bytes);reader.set_limit_bits(outer.len());
+        let element=parse_oamd_element(&mut reader,false,3,0).unwrap();assert!(matches!(element.kind,OamdElementKind::Trim(_)));
+        assert_eq!(reader.read_bits(4),Some(13));
+    }
+    #[test]
+    fn oamd_trim_state_survives_absent_updates_and_resets_on_object_topology_change() {
+        let mut state=OamdPayloadParseState::default();let mut p=payload_with_object_blocks(vec![vec![];2]);
+        p.trim=Some(OamdTrimElement{global_mode:1,..Default::default()});state.resolve_payload(&mut p);
+        let mut next=payload_with_object_blocks(vec![vec![];2]);state.resolve_payload(&mut next);assert_eq!(next.trim,p.trim);
+        let mut changed=payload_with_object_blocks(vec![vec![];3]);state.resolve_payload(&mut changed);assert!(changed.trim.is_none());
+    }
+
+    #[test]
+    fn oamd_optional_trim_elements_do_not_reset_differential_object_state() {
+        let mut state=OamdPayloadParseState::default();let mut p=payload_with_object_blocks(vec![vec![]]);state.resolve_payload(&mut p);
+        state.elements[0].object.as_mut().unwrap().objects[0].gain=Some(-3.);
+        let mut next=p.clone();next.element_count+=1;next.elements.insert(0,OamdElement{element_index:2,byte_length:1,kind:OamdElementKind::Trim(OamdTrimElement::default())});
+        state.resolve_payload(&mut next);assert_eq!(state.elements.len(),1);assert_eq!(state.elements[0].object.as_ref().unwrap().objects[0].gain,Some(-3.));
+        let mut only_trim=next.clone();only_trim.elements.remove(1);only_trim.element_count=1;state.resolve_payload(&mut only_trim);
+        assert_eq!(state.elements[0].object.as_ref().unwrap().objects[0].gain,Some(-3.));
+    }
+
 }
